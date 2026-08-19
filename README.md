@@ -138,4 +138,23 @@
 **Windows PC에서** `EXE만들기.bat`을 더블클릭하면 `dist\FileForge.exe`가 생성됩니다.
 이 파일 하나만 복사해서 Python 없는 PC에서도 더블클릭으로 실행할 수 있습니다.
 
+빌드 스크립트는 단계마다 검사하고, 문제가 있으면 **한국어로 원인·해결 방법을 알려주고 멈춥니다.**
+
+| 검사 | 실패 시 |
+|---|---|
+| Python 설치 여부 | 설치 방법 안내 후 중단 |
+| 원본 `.pyw` 존재 여부 | 실행 위치 안내 후 중단 |
+| 부품 설치 성공 여부 | 인터넷/보안정책 안내 후 **중단** |
+| 부품 import 가능 여부 | **중단** — 반쪽짜리 EXE 방지 |
+| `pywin32`(한글 변환용) | 경고만 하고 계속 (LibreOffice로 대체) |
+
+**인터넷이 막힌 PC**라면, 같은 폴더에 `wheels/` 폴더(미리 받아둔 부품)를 넣어두면
+`EXE만들기.bat`이 자동으로 감지해 인터넷 없이 설치합니다.
+`wheels/`는 인터넷 되는 PC에서 아래 명령으로 만들 수 있습니다.
+
+```
+pip download --dest wheels --platform win_amd64 --python-version 313 --only-binary=:all: pyinstaller pypdf Pillow pywin32 openpyxl pymupdf pillow-heif
+```
+
 > EXE 빌드는 Windows에서만 가능합니다 (macOS에서 Windows용 EXE 크로스 빌드 불가).
+> 맥에서는 같은 소스를 PyInstaller `--windowed`로 빌드해 `FileForge.app`을 만들 수 있습니다.
