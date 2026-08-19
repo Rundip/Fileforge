@@ -80,22 +80,38 @@ def safe_join(folder, rel):
     return target
 
 
-def list_files(folder, exts):
-    files, all_names = [], []
+def list_files(folder, exts, include="files"):
+    """폴더 안의 항목 목록.
+
+    include — "files": 파일만 / "dirs": 폴더만 / "both": 파일+폴더.
+    이름 변경 규칙은 폴더에도 그대로 쓸 수 있어서, 폴더도 목록에 담아 돌려준다.
+    (폴더는 확장자가 없으므로 확장자 필터의 영향을 받지 않는다)"""
+    want_files = include in ("files", "both")
+    want_dirs = include in ("dirs", "both")
+    items, all_names = [], []
     for name in os.listdir(folder):
         path = os.path.join(folder, name)
         if name.startswith("."):
             continue
         all_names.append(name)
-        if not os.path.isfile(path):
-            continue
-        ext = os.path.splitext(name)[1].lower().lstrip(".")
-        if exts and ext not in exts:
-            continue
-        files.append({"name": name, "mtime": os.path.getmtime(path)})
-    files.sort(key=lambda f: [int(t) if t.isdigit() else t.lower()
-                              for t in re.split(r"(\d+)", f["name"])])
-    return files, all_names
+        is_dir = os.path.isdir(path)
+        if is_dir:
+            if not want_dirs:
+                continue
+        else:
+            if not want_files or not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(name)[1].lower().lstrip(".")
+            if exts and ext not in exts:
+                continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        items.append({"name": name, "mtime": mtime, "isDir": is_dir})
+    # 폴더를 먼저, 그 다음 파일 — 각각 사람이 보기 좋은 자연 정렬(숫자 순)
+    items.sort(key=lambda f: (not f["isDir"], _natkey(f["name"])))
+    return items, all_names
 
 
 def execute_jobs(folder, jobs, mode):
@@ -168,9 +184,11 @@ def undo_last():
             shutil.move(cur, old)
         except OSError as e:
             errors.append(f"{os.path.basename(cur)}: {e}")
+    removed_dirs = 0
     for d in reversed(last["dirs"]):
         try:
             os.rmdir(d)  # 비어 있을 때만 삭제됨
+            removed_dirs += 1
         except OSError:
             pass
     dirs = set()
@@ -179,7 +197,97 @@ def undo_last():
         dirs.add(os.path.dirname(old))
     dirs.update(last["dirs"])
     notify_shell_change(dirs)
-    return len(last["moves"]), errors
+    return len(last["moves"]), errors, removed_dirs
+
+
+def make_dirs(folder, names, moves=None):
+    """폴더를 한꺼번에 만든다. (선택적으로 파일을 그 폴더로 이동)
+
+    - 이미 있는 폴더는 건너뛴다(덮어쓰지 않음)
+    - 일부가 실패해도 나머지는 계속 진행하고, 실패 사유를 모아서 돌려준다
+    - 만든 폴더·옮긴 파일을 undo 배치 1개로 묶어 '실행 취소'로 한 번에 되돌릴 수 있다"""
+    base = os.path.realpath(folder)
+    created_dirs = []   # 실제로 새로 만들어진 모든 폴더(중간 경로 포함) — 실행 취소용
+    made, skipped, errors = 0, [], []
+
+    for rel in names:
+        rel = (rel or "").strip().strip("/\\")
+        if not rel:
+            continue
+        try:
+            path = safe_join(folder, rel)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        if os.path.isdir(path):
+            skipped.append(rel)
+            continue
+        if os.path.exists(path):
+            errors.append(f"{rel}: 같은 이름의 파일이 이미 있어 폴더를 만들 수 없습니다")
+            continue
+        # 새로 생기는 상위 경로까지 기록해 둬야 실행 취소가 깨끗하게 된다
+        missing, p = [], path
+        while os.path.realpath(p) != base and not os.path.isdir(p):
+            missing.append(p)
+            p = os.path.dirname(p)
+        try:
+            os.makedirs(path, exist_ok=True)
+            created_dirs.extend(reversed(missing))   # 상위 → 하위 순서
+            made += 1
+        except OSError as e:
+            errors.append(f"{rel}: {e}")
+
+    move_batch = []
+    for m in (moves or []):
+        src_name = m.get("src", "")
+        if os.sep in src_name or "/" in src_name or src_name in (".", ".."):
+            errors.append(f"잘못된 파일명: {src_name}")
+            continue
+        try:
+            src = safe_join(folder, src_name)
+            dst = safe_join(folder, m.get("dst", ""))
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        try:
+            if not os.path.exists(src):
+                errors.append(f"{src_name}: 파일을 찾을 수 없습니다")
+                continue
+            if os.path.exists(dst):
+                errors.append(f"{src_name}: 대상 폴더에 같은 이름이 이미 있습니다")
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            move_batch.append((dst, src))
+        except OSError as e:
+            errors.append(f"{src_name}: {e}")
+
+    if created_dirs or move_batch:
+        UNDO_STACK.append({"moves": move_batch, "dirs": created_dirs})
+
+    notify = {folder}
+    notify.update(created_dirs)
+    for dst, src in move_batch:
+        notify.add(os.path.dirname(dst))
+        notify.add(os.path.dirname(src))
+    notify_shell_change(notify)
+    return {"made": made, "skipped": len(skipped), "skippedNames": skipped[:20],
+            "moved": len(move_batch), "errors": errors}
+
+
+def open_in_explorer(path):
+    """결과를 바로 확인할 수 있게 탐색기(Finder)에서 폴더를 연다."""
+    if not path or not os.path.isdir(path):
+        raise ValueError("폴더를 찾을 수 없습니다.")
+    try:
+        if os.name == "nt":
+            os.startfile(path)                       # Windows 탐색기
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])         # macOS Finder
+        else:
+            subprocess.Popen(["xdg-open", path])     # Linux
+    except OSError as e:
+        raise RuntimeError(f"폴더를 열지 못했습니다: {e}")
 
 
 # ---------------- PDF · 변환 도구 ----------------
@@ -1157,17 +1265,53 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
 .tree .tbadge{margin-left:auto}
 .tree .tfiles{margin-left:24px;border-left:1px solid var(--hairline-soft);
   padding-left:14px;margin-top:2px;margin-bottom:8px}
+.tree .tsub{display:flex;align-items:center;gap:8px;padding:2px 0;color:var(--mute);font-size:13px}
+
+/* ===== 폴더 만들기 탭 ===== */
+.mkpanel{display:none;padding:24px 0;border-bottom:1px solid var(--hairline-soft)}
+.mkpanel.show{display:block}
+.mkpanel h3{font-size:16px;font-weight:500;line-height:1.75;margin-bottom:8px}
+.area{background:var(--cloud);border:2px solid transparent;border-radius:16px;
+  padding:12px 16px;outline:none;width:100%;max-width:520px;min-height:132px;resize:vertical;
+  font-family:var(--font-ui);font-size:15px;line-height:1.6;color:var(--ink);transition:all .12s}
+.area:focus{background:var(--canvas);border-color:var(--ink);box-shadow:0 0 0 6px var(--cloud)}
+.area.half{max-width:320px}
+.mk-two{display:flex;gap:18px;flex-wrap:wrap}
+.mk-two .col{display:flex;flex-direction:column;gap:8px}
+.mk-two .col .lbl{font-size:12px;font-weight:500;color:var(--mute);text-transform:uppercase}
+#mkCommon{padding:24px 0;border-bottom:1px solid var(--hairline-soft)}
+#mkTreeWrap{margin-top:26px}
+.mk-actions{margin-top:18px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+/* 폴더 아이콘 (이름 변경 미리보기에서 폴더 구분) */
+.ficon{margin-right:6px}
+
+/* 자동저장 표시 · 최근 작업 이력 */
+.utility .saved{color:var(--mute)}
+.utility button{font-size:12px;font-weight:500;text-decoration:underline;text-underline-offset:3px}
+#histBox{margin-top:48px;border-top:1px solid var(--hairline);padding-top:18px}
+#histBox summary{font-size:14px;font-weight:500;cursor:pointer;list-style:none}
+#histBox summary::-webkit-details-marker{display:none}
+#histBox summary::before{content:"▸ ";color:var(--mute)}
+#histBox[open] summary::before{content:"▾ "}
+.hrow{display:grid;grid-template-columns:150px 110px 1fr;gap:12px;padding:8px 0;
+  border-bottom:1px solid var(--hairline-soft);font-size:13px}
+.hrow .htime{color:var(--mute);font-weight:500}
+.hrow .hkind{font-weight:500}
 </style>
 </head>
 <body>
 
-<div class="utility"><span>FileForge — 파일 자동화 도구</span><span>Windows Edition</span></div>
+<div class="utility"><span>FileForge — 파일 자동화 도구</span>
+  <span class="saved" id="savedAt">자동저장 대기 중</span>
+  <button onclick="clearDraft()" title="입력한 규칙·목록을 모두 비웁니다">입력 초기화</button></div>
 
 <nav>
   <span class="wordmark">FileForge</span>
   <div class="nav-tabs">
     <button class="nav-tab active" data-tab="rename" onclick="switchTab('rename')">이름 변경</button>
     <button class="nav-tab" data-tab="organize" onclick="switchTab('organize')">폴더 정리</button>
+    <button class="nav-tab" data-tab="make" onclick="switchTab('make')">폴더 만들기</button>
     <button class="nav-tab" data-tab="pdf" onclick="switchTab('pdf')">PDF · 변환</button>
   </div>
   <input id="extFilter" class="search-pill" placeholder="확장자 필터 (jpg,png)"
@@ -1188,6 +1332,15 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
   <!-- ===== 이름 변경 탭 ===== -->
   <section id="tab-rename">
     <div class="section-head"><h2>Rules</h2><span class="count">칩을 눌러 규칙을 켜고 끄세요 — 위에서 아래 순서로 적용됩니다</span></div>
+    <div class="row" id="targetRow" style="margin-top:18px">
+      <span class="hint">변경 대상</span>
+      <select class="field" id="renameTarget" onchange="onTargetChange()">
+        <option value="files">파일만</option>
+        <option value="dirs">폴더만</option>
+        <option value="both">파일 + 폴더</option>
+      </select>
+      <span class="hint">아래 <b>모든 규칙</b>이 폴더 이름에도 똑같이 적용됩니다. 폴더는 확장자가 없어서 이름 전체가 바뀌고, 미리보기에서 📁 로 표시됩니다.</span>
+    </div>
     <div class="chips">
       <button class="chip" data-rule="rebuild" onclick="toggleRule(this)">이름 새로 입력</button>
       <button class="chip" data-rule="mapname" onclick="toggleRule(this)">키워드별 지정값으로 변경</button>
@@ -1330,6 +1483,127 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
     </div>
   </section>
 
+  <!-- ===== 폴더 만들기 탭 ===== -->
+  <section id="tab-make" style="display:none">
+    <div class="section-head"><h2>Make Folders</h2><span class="count">선택한 폴더 안에 새 폴더를 한 번에 만듭니다 — 이미 있는 폴더는 건드리지 않습니다</span></div>
+    <div class="chips" id="mkChips">
+      <button class="chip active" data-mk="list" onclick="pickMk(this)">목록으로 만들기</button>
+      <button class="chip" data-mk="number" onclick="pickMk(this)">번호로 만들기</button>
+      <button class="chip" data-mk="date" onclick="pickMk(this)">날짜로 만들기</button>
+      <button class="chip" data-mk="combo" onclick="pickMk(this)">조합으로 만들기 (A × B)</button>
+      <button class="chip" data-mk="fromfiles" onclick="pickMk(this)">파일 이름으로 만들기</button>
+    </div>
+
+    <div class="mkpanel show" id="mk-list">
+      <h3>목록으로 만들기 — 한 줄에 폴더 이름 하나씩</h3>
+      <p class="hint" style="margin-bottom:10px">엑셀에서 이름이 적힌 열을 복사해 그대로 붙여넣어도 됩니다.
+        <b>/</b> 를 쓰면 하위 폴더까지 한 번에 만들어집니다. (예: <b>2026/01월</b>)</p>
+      <textarea class="area" id="mkList" placeholder="1_기획&#10;2_디자인&#10;3_개발" oninput="renderMake()"></textarea>
+      <div class="mk-actions">
+        <button class="btn btn-secondary btn-sm" onclick="mkSample()">예시로 채우기</button>
+        <button class="btn btn-secondary btn-sm" onclick="mkDedup()">중복 줄 정리</button>
+        <button class="btn btn-secondary btn-sm" onclick="mkFromClipboard()">붙여넣기</button>
+        <button class="btn btn-secondary btn-sm" onclick="$('mkList').value='';renderMake()">비우기</button>
+      </div>
+    </div>
+
+    <div class="mkpanel" id="mk-number">
+      <h3>번호로 만들기 — 같은 이름 + 일련번호</h3>
+      <div class="row">
+        <input class="field" id="mkNumBase" placeholder="앞에 붙일 이름 (예: 사진_)" oninput="renderMake()">
+        <input class="field" id="mkNumTail" placeholder="뒤에 붙일 이름 (선택)" oninput="renderMake()">
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span class="hint">시작 번호</span>
+        <input class="field narrow" id="mkNumStart" type="number" value="1" min="0" oninput="renderMake()">
+        <span class="hint">자릿수</span>
+        <input class="field narrow" id="mkNumPad" type="number" value="2" min="1" max="6" oninput="renderMake()">
+        <span class="hint">개수</span>
+        <input class="field narrow" id="mkNumCount" type="number" value="10" min="1" max="500" oninput="renderMake()">
+        <span class="hint">한 번에 최대 500개까지 만들 수 있습니다.</span>
+      </div>
+    </div>
+
+    <div class="mkpanel" id="mk-date">
+      <h3>날짜로 만들기 — 기간을 정하면 날짜 폴더가 쭉 만들어집니다</h3>
+      <div class="row">
+        <span class="hint">시작</span><input class="field" id="mkDateFrom" type="date" onchange="renderMake()">
+        <span class="hint">종료</span><input class="field" id="mkDateTo" type="date" onchange="renderMake()">
+        <select class="field" id="mkDateUnit" onchange="renderMake()">
+          <option value="day">하루마다</option><option value="week">일주일마다</option>
+          <option value="month" selected>한 달마다</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span class="hint">형식</span>
+        <select class="field" id="mkDateFmt" onchange="renderMake()">
+          <option value="YYYY-MM">2026-01</option>
+          <option value="YYYY년 MM월">2026년 01월</option>
+          <option value="YYYY-MM-DD">2026-01-05</option>
+          <option value="YYYYMMDD">20260105</option>
+          <option value="MM월">01월</option>
+        </select>
+        <input class="field" id="mkDatePre" placeholder="앞에 붙일 이름 (선택)" oninput="renderMake()">
+      </div>
+    </div>
+
+    <div class="mkpanel" id="mk-combo">
+      <h3>조합으로 만들기 — A 목록 × B 목록</h3>
+      <p class="hint" style="margin-bottom:12px">예) A에 <b>영업팀·관리팀</b>, B에 <b>1월·2월</b> 을 넣으면 4개 조합이 만들어집니다.</p>
+      <div class="mk-two">
+        <div class="col"><span class="lbl">A 목록 (한 줄에 하나)</span>
+          <textarea class="area half" id="mkComboA" placeholder="영업팀&#10;관리팀" oninput="renderMake()"></textarea></div>
+        <div class="col"><span class="lbl">B 목록 (한 줄에 하나)</span>
+          <textarea class="area half" id="mkComboB" placeholder="1월&#10;2월" oninput="renderMake()"></textarea></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <select class="field" id="mkComboMode" onchange="renderMake()">
+          <option value="nested">A 폴더 안에 B 폴더 (영업팀/1월)</option>
+          <option value="flat">한 폴더 이름으로 합치기 (영업팀_1월)</option>
+        </select>
+        <span class="hint">이어붙일 기호</span>
+        <input class="field narrow" id="mkComboSep" value="_" oninput="renderMake()">
+      </div>
+    </div>
+
+    <div class="mkpanel" id="mk-fromfiles">
+      <h3>파일 이름으로 만들기 — 폴더 안 파일 이름을 그대로 폴더로</h3>
+      <p class="hint" style="margin-bottom:12px">상단에서 폴더를 먼저 선택하세요. 파일이 많을 때 <b>같은 이름 규칙끼리 묶어</b> 폴더를 만들고, 원하면 파일을 그 안으로 옮겨줍니다.</p>
+      <div class="row">
+        <span class="hint">폴더 이름 기준</span>
+        <select class="field" id="mkFfMode" onchange="renderMake()">
+          <option value="whole">파일 이름 전체 (확장자 제외)</option>
+          <option value="delim">기호 앞부분까지</option>
+          <option value="firstN">앞에서 N글자</option>
+        </select>
+        <input class="field narrow" id="mkFfDelim" value="_" oninput="renderMake()" title="기호 앞부분까지 기준일 때 사용">
+        <input class="field narrow" id="mkFfN" type="number" value="4" min="1" max="40" oninput="renderMake()" title="앞에서 N글자 기준일 때 사용">
+      </div>
+      <div class="row" style="margin-top:12px">
+        <label class="opt"><input type="checkbox" id="mkFfMove" onchange="renderMake()"> 만든 폴더로 파일도 함께 옮기기</label>
+        <span class="hint">옮긴 파일도 <b>실행 취소</b>로 한 번에 원위치됩니다.</span>
+      </div>
+    </div>
+
+    <div id="mkCommon">
+      <h3 style="font-size:16px;font-weight:500;margin-bottom:12px">공통 옵션</h3>
+      <div class="row">
+        <span class="hint">상위 폴더</span>
+        <input class="field" id="mkParent" placeholder="예: 2026년_자료 (비우면 선택한 폴더 바로 아래)" oninput="renderMake()" style="width:320px">
+      </div>
+      <div class="row" style="margin-top:12px;align-items:flex-start">
+        <span class="hint" style="margin-top:10px">하위 폴더 공통 생성</span>
+        <input class="field" id="mkSubs" placeholder="예: 01_원본, 02_작업, 03_완료 (쉼표로 구분)" oninput="renderMake()" style="width:420px">
+      </div>
+      <p class="hint" style="margin-top:10px">만들어지는 모든 폴더 안에 같은 하위 폴더를 함께 만들어 둡니다. 필요 없으면 비워 두세요.</p>
+    </div>
+
+    <div id="mkTreeWrap">
+      <div class="section-head"><h2>만들어질 폴더 미리보기</h2><span class="count" id="mkInfo"></span></div>
+      <div id="mkTree" class="tree"><div class="empty">위에서 폴더 이름을 입력하면 만들어질 구조가 표시됩니다.</div></div>
+    </div>
+  </section>
+
   <!-- ===== PDF · 변환 탭 ===== -->
   <section id="tab-pdf" style="display:none">
     <div class="section-head"><h2>PDF · 변환</h2><span class="count">작업을 고르고, 아래 목록에서 파일을 선택하세요</span></div>
@@ -1376,12 +1650,17 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
     <div class="thead"><span style="margin-left:6px">포함</span><span>현재 이름</span><span class="col-text">붙일 텍스트</span><span>변경 후</span><span>상태</span></div>
     <div id="rows"><div class="empty">폴더를 선택하면 파일 목록이 표시됩니다. 행을 클릭하면 제외/포함이 전환됩니다.</div></div>
   </section>
+  <details id="histBox">
+    <summary>최근 작업 이력 (이 컴퓨터에만 저장됩니다 · 최대 30건)</summary>
+    <div id="histRows"></div>
+  </details>
 </main>
 
 <div class="actionbar">
   <span class="status" id="statusBar">대기 중</span>
-  <button class="btn btn-secondary" id="btnUndo" onclick="doUndo()" disabled>실행 취소</button>
-  <button class="btn btn-primary" id="btnRun" onclick="askExecute()" disabled>변경 실행</button>
+  <button class="btn btn-secondary" id="btnOpen" onclick="openFolder()" disabled title="탐색기에서 이 폴더 열기">폴더 열기</button>
+  <button class="btn btn-secondary" id="btnUndo" onclick="doUndo()" disabled>실행 취소 (Ctrl+Z)</button>
+  <button class="btn btn-primary" id="btnRun" onclick="askExecute()" disabled>변경 실행 (Ctrl+Enter)</button>
 </div>
 
 <div class="scrim" id="scrim">
@@ -1389,7 +1668,7 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
     <h3 id="dlgTitle"></h3>
     <p id="dlgBody"></p>
     <div class="row">
-      <button class="btn btn-secondary" onclick="closeDialog()">취소</button>
+      <button class="btn btn-secondary" id="dlgCancel" onclick="closeDialog()">취소</button>
       <button class="btn btn-primary" id="dlgOk">실행</button>
     </div>
   </div>
@@ -1412,7 +1691,8 @@ const CATEGORIES = {
 
 let state = {folder:"", files:[], allNames:[], dirs:[], tab:"rename", org:"category",
              preview:[], canUndo:false, perText:{}, nApply:0, nConflict:0,
-             pdfOp:"merge", pdfFiles:[], pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[]};
+             pdfOp:"merge", pdfFiles:[], pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[],
+             renameTarget:"files", loadedInclude:"", mkMode:"list", mkPlan:null};
 const $ = id => document.getElementById(id);
 
 async function api(path, body){
@@ -1427,32 +1707,66 @@ async function pickFolder(){
 }
 
 let reloadTimer;
-function debounceReload(){ clearTimeout(reloadTimer); reloadTimer=setTimeout(reload,300); }
+function debounceReload(){ clearTimeout(reloadTimer); reloadTimer=setTimeout(()=>reload(),300); }
 
-async function reload(){
+// 지금 화면에 필요한 목록 종류 — '이름 변경' 탭에서만 폴더를 함께 불러온다
+function neededInclude(){
+  return state.tab==="rename" ? (state.renameTarget || "files") : "files";
+}
+
+async function reload(silent){
   if(!state.folder) return;
   const exts = $("extFilter").value.split(",").map(s=>s.trim().toLowerCase().replace(/^\./,"")).filter(Boolean);
-  const res = await api("/api/list",{folder:state.folder, exts});
-  if(res.error){ setStatus(res.error, true); return; }
+  const include = neededInclude();
+  const res = await api("/api/list",{folder:state.folder, exts, include});
+  if(res.error){
+    if(silent){   // 시작할 때 되살린 폴더가 없어졌을 뿐이니 부드럽게 안내
+      state.folder = ""; $("btnOpen").disabled = true;
+      setStatus("이전에 쓰던 폴더를 찾을 수 없습니다. 위쪽 <b>폴더 선택</b>으로 다시 지정해 주세요.", false, true);
+    }else setStatus(res.error, true);
+    return;
+  }
   res.files.forEach(f=>f.excluded=false);
   state.files = res.files; state.allNames = res.allNames; state.dirs = res.dirs || []; state.perText = {};
+  state.loadedInclude = include;
   document.body.classList.add("loaded");
   $("heroTitle").innerHTML = "Forge Every File.";
-  $("heroPath").textContent = state.folder + "  ·  파일 " + state.files.length + "개";
+  const nDir = state.files.filter(f=>f.isDir).length, nFile = state.files.length - nDir;
+  $("heroPath").textContent = state.folder + "  ·  "
+    + (include==="files" ? `파일 ${nFile}개` : `파일 ${nFile}개 · 폴더 ${nDir}개`);
+  $("btnOpen").disabled = false;
+  savePrefs();
   recompute();
   if(state.tab==="pdf") loadPdfFiles();
 }
 
-function switchTab(tab){
+async function switchTab(tab){
   state.tab = tab;
   document.querySelectorAll(".nav-tab").forEach(b=>b.classList.toggle("active", b.dataset.tab===tab));
   $("tab-rename").style.display = tab==="rename" ? "" : "none";
   $("tab-organize").style.display = tab==="organize" ? "" : "none";
+  $("tab-make").style.display = tab==="make" ? "" : "none";
   $("tab-pdf").style.display = tab==="pdf" ? "" : "none";
-  $("previewSection").style.display = tab==="pdf" ? "none" : "";
+  $("previewSection").style.display = (tab==="pdf" || tab==="make") ? "none" : "";
   document.querySelector(".actionbar").style.display = tab==="pdf" ? "none" : "";
-  if(tab==="pdf"){ renderPdfOptions(); loadPdfFiles(); }
-  else recompute();
+  $("btnRun").textContent = tab==="organize" ? "정리 실행 (Ctrl+Enter)"
+                          : tab==="make" ? "폴더 만들기 (Ctrl+Enter)" : "변경 실행 (Ctrl+Enter)";
+  savePrefs();
+  if(tab==="pdf"){ renderPdfOptions(); loadPdfFiles(); return; }
+  // 탭마다 필요한 목록이 달라서(폴더 포함 여부) 다르면 다시 불러온다
+  if(state.folder && neededInclude() !== state.loadedInclude){ await reload(); return; }
+  recompute();
+}
+
+// 이름 변경 대상(파일/폴더) 전환
+async function onTargetChange(){
+  state.renameTarget = $("renameTarget").value;
+  const dirsOnly = state.renameTarget === "dirs";
+  $("extFilter").disabled = dirsOnly;                       // 폴더는 확장자가 없음
+  $("extFilter").style.opacity = dirsOnly ? ".35" : "";
+  $("extFilter").placeholder = dirsOnly ? "폴더는 확장자 없음" : "확장자 필터 (jpg,png)";
+  savePrefs();
+  if(state.folder) await reload(); else recompute();
 }
 
 function toggleRule(chip){
@@ -1564,10 +1878,16 @@ function fmtDate(d, fmt){
           "YYMMDD":`${String(Y).slice(2)}${M}${D}`, "YYYY.MM.DD":`${Y}.${M}.${D}`}[fmt];
 }
 
-function buildNewName(name, mtime, seq){
+// 폴더는 확장자가 없으므로 이름 전체가 stem — 파일만 마지막 점 뒤를 확장자로 본다
+function splitName(name, isDir){
+  if(isDir) return [name, ""];
   const i = name.lastIndexOf(".");
-  let stem = i>0 ? name.slice(0,i) : name;
-  let ext  = i>0 ? name.slice(i) : "";
+  return i>0 ? [name.slice(0,i), name.slice(i)] : [name, ""];
+}
+
+function buildNewName(f, seq){
+  const name = f.name, mtime = f.mtime;
+  let [stem, ext] = splitName(name, f.isDir);
 
   if(ruleOn("rebuild")){
     const mode = $("rebuildMode").value;
@@ -1662,8 +1982,8 @@ function computePreview(){
       if(sub === null) state.preview.push({disp:"—", st:"해당 없음", target:null});
       else state.preview.push({disp:sub+"/"+f.name, st:"이동", target:sub+"/"+f.name});
     }else{
-      const nn = buildNewName(f.name, f.mtime, seq++);
-      const stem = nn.lastIndexOf(".")>0 ? nn.slice(0,nn.lastIndexOf(".")) : nn;
+      const nn = buildNewName(f, seq++);
+      const stem = splitName(nn, f.isDir)[0];
       if(INVALID.test(nn) || !stem.trim()) state.preview.push({disp:nn, st:"⚠ 사용불가", target:null});
       else if(nn===f.name) state.preview.push({disp:nn, st:"변경 없음", target:null});
       else state.preview.push({disp:nn, st:"변경", target:nn});
@@ -1706,9 +2026,12 @@ function rowClass(i){
 }
 
 function updateStatusBar(){
-  $("previewCount").textContent = "파일 " + state.files.length + "개";
+  if(state.tab==="make") return;
+  const nDir = state.files.filter(f=>f.isDir).length;
+  const label = nDir ? `파일·폴더 ${state.files.length}개` : `파일 ${state.files.length}개`;
+  $("previewCount").textContent = label;
   $("btnRun").disabled = state.nApply===0;
-  let msg = `파일 <b>${state.files.length}</b>개 · 적용 대상 <b class="ok">${state.nApply}</b>개`;
+  let msg = `${nDir?"항목":"파일"} <b>${state.files.length}</b>개 · 적용 대상 <b class="ok">${state.nApply}</b>개`;
   if(state.nConflict) msg += ` · <span class="warn">⚠ 충돌 ${state.nConflict}개 자동 제외</span>`;
   setStatus(msg, false, true);
 }
@@ -1727,6 +2050,7 @@ function onRebuildModeChange(){
 
 // 전체 재계산 + 표 전체 다시 그리기 (규칙 토글·폴더 로드·포함 전환 등)
 function recompute(){
+  if(state.tab==="make"){ renderMake(); return; }   // 폴더 만들기 탭은 별도 미리보기
   document.body.classList.toggle("textcol", state.tab!=="organize" && (ruleOn("pertext") || rebuildPerfileOn()));
   computePreview();
   render();
@@ -1809,9 +2133,9 @@ function render(){
     const tv = state.perText[f.name] || "";
     html += `<div class="frow ${rowClass(i)}" data-index="${i}" onmousedown="startRowToggle(event,${i})">
       <span class="firstcell"><span class="grip" title="드래그하여 순서 변경" onmousedown="startReorder(event,${i})">⠿</span><span class="dot"></span></span>
-      <span class="old">${esc(f.name)}</span>
+      <span class="old">${f.isDir?'<span class="ficon" title="폴더">📁</span>':''}${esc(f.name)}</span>
       <span class="col-text"><span class="cell"><input class="tcell" value="${escA(tv)}" placeholder="텍스트" oninput="onPerTextInput(${i},this.value)" onpaste="onPerTextPaste(event,${i})" onclick="event.stopPropagation()"><span class="fillh" onmousedown="startFill(event,${i})" title="드래그하여 같은 값 채우기"></span></span></span>
-      <span class="new">${esc(p.disp)}</span>
+      <span class="new">${(f.isDir&&p.target)?'<span class="ficon">📁</span>':''}${esc(p.disp)}</span>
       <span class="st">${p.st}</span></div>`;
   });
   box.innerHTML = html;
@@ -1942,7 +2266,19 @@ function setStatus(msg, isErr, isHtml){
   el.style.color = isErr ? "var(--sale)" : "";
 }
 
+// 확인 창 (제목·본문·버튼 문구를 상황에 맞게 바꿔 쓴다)
+function showDialog(title, bodyHtml, okLabel, onOk, cancelLabel, onCancel){
+  $("dlgTitle").textContent = title;
+  $("dlgBody").innerHTML = bodyHtml;
+  $("dlgOk").textContent = okLabel || "실행";
+  $("dlgCancel").textContent = cancelLabel || "취소";
+  $("dlgOk").onclick = ()=>{ closeDialog(); if(onOk) onOk(); };
+  $("dlgCancel").onclick = ()=>{ closeDialog(); if(onCancel) onCancel(); };
+  $("scrim").classList.add("show");
+}
+
 function askExecute(){
+  if(state.tab==="make") return askMake();
   const organize = state.tab==="organize";
   const jobs = [];
   state.files.forEach((f,i)=>{
@@ -1950,10 +2286,13 @@ function askExecute(){
     if(p.target && !f.excluded) jobs.push({src:f.name, dst:p.target});
   });
   if(!jobs.length) return;
-  $("dlgTitle").textContent = organize ? "폴더 정리 실행" : "이름 변경 실행";
-  $("dlgBody").textContent = jobs.length + "개 파일에 적용합니다. 실행 후에도 한 번에 되돌릴 수 있습니다.";
-  $("dlgOk").onclick = ()=>{ closeDialog(); doExecute(jobs, organize); };
-  $("scrim").classList.add("show");
+  const nDir = state.files.filter((f,i)=>f.isDir && state.preview[i].target && !f.excluded).length;
+  const nFile = jobs.length - nDir;
+  const what = [nFile ? `파일 ${nFile}개` : "", nDir ? `폴더 ${nDir}개` : ""].filter(Boolean).join(" · ");
+  showDialog(organize ? "폴더 정리 실행" : "이름 변경 실행",
+             `${what}에 적용합니다. 실행 후에도 <b>실행 취소</b>로 한 번에 되돌릴 수 있습니다.`,
+             organize ? "정리 실행" : "변경 실행",
+             ()=>doExecute(jobs, organize));
 }
 function closeDialog(){ $("scrim").classList.remove("show"); }
 
@@ -1963,9 +2302,11 @@ async function doExecute(jobs, organize){
   if(res.error){ setStatus(res.error, true); return; }
   state.canUndo = res.canUndo; $("btnUndo").disabled = !res.canUndo;
   await reload();
-  let msg = `<b class="ok">${res.done}개 파일 ${organize?"이동":"이름 변경"} 완료</b> · 실행 취소 가능`;
+  let msg = `<b class="ok">${res.done}개 ${organize?"이동":"이름 변경"} 완료</b> · 실행 취소 가능`;
   if(res.errors.length) msg += ` · <span class="warn">실패 ${res.errors.length}건: ${esc(res.errors[0])}</span>`;
   setStatus(msg, false, true);
+  addHistory(organize ? "폴더 정리" : "이름 변경",
+             `${res.done}개 성공` + (res.errors.length ? ` · 실패 ${res.errors.length}건` : ""));
 }
 
 async function doUndo(){
@@ -1973,8 +2314,402 @@ async function doUndo(){
   if(res.error){ setStatus(res.error, true); return; }
   $("btnUndo").disabled = !res.canUndo;
   await reload();
-  setStatus(`<b>${res.restored}개 파일을 원래대로 되돌렸습니다</b>`, false, true);
+  const parts = [];
+  if(res.restored) parts.push(`${res.restored}개를 원래 자리로 되돌림`);
+  if(res.removedDirs) parts.push(`새로 만든 폴더 ${res.removedDirs}개 삭제`);
+  setStatus(`<b>${parts.join(" · ") || "되돌릴 내용이 없습니다"}</b>`, false, true);
+  if(parts.length) addHistory("실행 취소", parts.join(" · "));
 }
+
+// 결과를 바로 확인할 수 있게 탐색기(Finder)에서 폴더 열기
+async function openFolder(){
+  if(!state.folder) return;
+  const res = await api("/api/open", {folder:state.folder});
+  if(res.error) setStatus(res.error, true);
+}
+
+// ================= 폴더 만들기 =================
+function pickMk(chip){
+  document.querySelectorAll("#mkChips .chip").forEach(c=>c.classList.remove("active"));
+  chip.classList.add("active");
+  state.mkMode = chip.dataset.mk;
+  document.querySelectorAll("#tab-make .mkpanel").forEach(p=>p.classList.remove("show"));
+  const p = $("mk-"+state.mkMode); if(p) p.classList.add("show");
+  savePrefs();
+  renderMake();
+}
+
+// 한 줄에 하나씩 입력된 값을 배열로
+function mkLines(id){
+  const el = $(id); if(!el) return [];
+  return el.value.split(/[\r\n]+/).map(t=>t.trim()).filter(Boolean);
+}
+// 폴더 이름으로 쓸 수 없는 글자를 정리 ('/'는 하위 폴더 구분자로 살려 둔다)
+function sanitizePath(v){
+  return String(v||"").replace(/\\/g,"/").split("/")
+    .map(seg=>seg.trim().replace(/[:*?"<>|]/g,"_").replace(/[. ]+$/,"").trim())
+    .filter(Boolean).join("/");
+}
+function mkSample(){
+  $("mkList").value = "01_기획\n02_디자인\n03_개발\n04_검수\n05_완료";
+  renderMake(); scheduleSave();
+}
+function mkDedup(){
+  const seen = new Set(), out = [];
+  mkLines("mkList").forEach(n=>{ const k=n.toLowerCase(); if(!seen.has(k)){ seen.add(k); out.push(n); } });
+  $("mkList").value = out.join("\n");
+  renderMake(); scheduleSave();
+}
+async function mkFromClipboard(){
+  try{
+    const t = await navigator.clipboard.readText();
+    if(!t){ setStatus("복사한 내용이 없습니다.", true); return; }
+    const cur = $("mkList").value.trim();
+    $("mkList").value = (cur ? cur+"\n" : "") + t.replace(/\t/g,"\n").trim();
+    renderMake(); scheduleSave();
+  }catch(e){
+    setStatus("브라우저가 붙여넣기를 막았습니다. 입력칸을 클릭한 뒤 Ctrl+V 를 눌러 주세요.", true);
+  }
+}
+
+function mkFmtDate(d, fmt){
+  const p = n=>String(n).padStart(2,"0");
+  const Y=d.getFullYear(), M=p(d.getMonth()+1), D=p(d.getDate());
+  return ({"YYYY-MM":`${Y}-${M}`, "YYYY년 MM월":`${Y}년 ${M}월`, "YYYY-MM-DD":`${Y}-${M}-${D}`,
+           "YYYYMMDD":`${Y}${M}${D}`, "MM월":`${M}월`})[fmt] || `${Y}-${M}-${D}`;
+}
+
+const MK_LIMIT = 500;   // 실수로 수천 개가 만들어지는 것을 막는 안전장치
+
+// 화면 입력값 → 만들 폴더 목록(plan) 계산. 실제 만들기 전 미리보기에도 그대로 쓴다.
+function makePlan(){
+  const parent = sanitizePath(gv("mkParent",""));
+  const subs = String(gv("mkSubs","")).split(/[,\n]/).map(sanitizePath).filter(Boolean);
+  const mode = state.mkMode;
+  let tops = [], warn = "";
+  const groups = new Map();   // 파일 이름으로 만들기: 폴더명 → 그 폴더로 갈 파일들
+
+  if(mode==="list"){
+    tops = mkLines("mkList").map(sanitizePath);
+  }else if(mode==="number"){
+    const base = gv("mkNumBase",""), tail = gv("mkNumTail","");
+    const start = parseInt(gv("mkNumStart","1"))||0;
+    const pad = Math.min(6, Math.max(1, parseInt(gv("mkNumPad","2"))||1));
+    let cnt = Math.max(0, parseInt(gv("mkNumCount","0"))||0);
+    if(cnt > MK_LIMIT){ cnt = MK_LIMIT; warn = `한 번에 ${MK_LIMIT}개까지만 만듭니다.`; }
+    for(let i=0;i<cnt;i++) tops.push(sanitizePath(base + String(start+i).padStart(pad,"0") + tail));
+  }else if(mode==="date"){
+    const from = gv("mkDateFrom",""), to = gv("mkDateTo","");
+    if(from && to){
+      const unit = gv("mkDateUnit","month"), fmt = gv("mkDateFmt","YYYY-MM"), pre = gv("mkDatePre","");
+      let d = new Date(from+"T00:00:00"), end = new Date(to+"T00:00:00");
+      if(!isNaN(d) && !isNaN(end) && d<=end){
+        const seen = new Set();
+        while(d<=end && tops.length<MK_LIMIT){
+          const nm = sanitizePath(pre + mkFmtDate(d, fmt));
+          if(nm && !seen.has(nm)){ seen.add(nm); tops.push(nm); }
+          if(unit==="day") d.setDate(d.getDate()+1);
+          else if(unit==="week") d.setDate(d.getDate()+7);
+          else d.setMonth(d.getMonth()+1);
+        }
+        if(d<=end) warn = `한 번에 ${MK_LIMIT}개까지만 만듭니다. 기간을 나눠서 실행해 주세요.`;
+      }else if(d>end) warn = "종료일이 시작일보다 빠릅니다.";
+    }
+  }else if(mode==="combo"){
+    const A = mkLines("mkComboA"), B = mkLines("mkComboB");
+    const nested = gv("mkComboMode","nested")==="nested";
+    const sep = gv("mkComboSep","_");
+    A.forEach(a=>{
+      if(!B.length){ tops.push(sanitizePath(a)); return; }
+      B.forEach(b=>{
+        tops.push(sanitizePath(nested ? a+"/"+b : a+sep+b));
+      });
+    });
+    if(tops.length > MK_LIMIT){ tops = tops.slice(0, MK_LIMIT); warn = `한 번에 ${MK_LIMIT}개까지만 만듭니다.`; }
+  }else if(mode==="fromfiles"){
+    const how = gv("mkFfMode","whole"), delim = gv("mkFfDelim","_");
+    const n = Math.max(1, parseInt(gv("mkFfN","4"))||1);
+    state.files.forEach(f=>{
+      if(f.isDir) return;
+      const stem = splitName(f.name, false)[0];
+      let key = stem;
+      if(how==="delim"){ const i = delim ? stem.indexOf(delim) : -1; key = i>0 ? stem.slice(0,i) : stem; }
+      else if(how==="firstN") key = stem.slice(0, n);
+      key = sanitizePath(key);
+      if(!key) return;
+      if(!groups.has(key)){ groups.set(key, []); tops.push(key); }
+      groups.get(key).push(f.name);
+    });
+    if(tops.length > MK_LIMIT){ tops = tops.slice(0, MK_LIMIT); warn = `한 번에 ${MK_LIMIT}개까지만 만듭니다.`; }
+  }
+
+  // 같은 이름 중복 제거(대소문자 무시)
+  const seen = new Set(), items = [];
+  tops.forEach(nm=>{ if(!nm) return; const k=nm.toLowerCase(); if(!seen.has(k)){ seen.add(k); items.push(nm); } });
+
+  const dirsLower = new Set((state.dirs||[]).map(d=>d.toLowerCase()));
+  const dirs = [], tree = [], moves = [];
+  if(parent) dirs.push(parent);
+  const moveOn = mode==="fromfiles" && $("mkFfMove") && $("mkFfMove").checked;
+  items.forEach(nm=>{
+    const full = parent ? parent+"/"+nm : nm;
+    dirs.push(full);
+    subs.forEach(sb=>dirs.push(full+"/"+sb));
+    const files = groups.get(nm) || [];
+    if(moveOn) files.forEach(fn=>moves.push({src:fn, dst:full+"/"+fn}));
+    tree.push({name:nm, full, subs, files,
+               exists: !parent && nm.indexOf("/")<0 && dirsLower.has(nm.toLowerCase())});
+  });
+  return {dirs, tree, moves, parent, subs, warn, moveOn};
+}
+
+// 만들어질 폴더 구조를 트리로 보여준다 (실행 전 확인용)
+function renderMake(){
+  const plan = makePlan();
+  state.mkPlan = plan;
+  const el = $("mkTree"), info = $("mkInfo");
+  const runBtn = $("btnRun");
+  if(!plan.tree.length && !plan.dirs.length){
+    el.innerHTML = '<div class="empty">'
+      + (state.mkMode==="fromfiles"
+          ? "상단의 <b>폴더 선택</b>으로 폴더를 지정하면, 그 안의 파일 이름으로 만들 폴더가 표시됩니다."
+          : "위에 폴더 이름을 입력하면 만들어질 구조가 여기에 표시됩니다.") + '</div>';
+    info.textContent = "";
+    if(runBtn) runBtn.disabled = true;
+    setStatus(state.folder ? "만들 폴더를 입력하세요" : "폴더를 먼저 선택하세요");
+    return;
+  }
+  const rootName = state.folder
+    ? (state.folder.replace(/[\\\/]+$/,"").split(/[\\\/]/).pop() || state.folder)
+    : "선택한 폴더";
+  const LIM = 6;
+  let h = `<div class="troot"><span class="ticon">📂</span><span class="tname">${esc(rootName)}</span></div><div class="tchildren">`;
+  if(plan.parent) h += `<div class="tfolder"><span class="ticon">📁</span><span class="tname">${esc(plan.parent)}</span><span class="tbadge tnew">상위</span></div>`;
+  const shown = plan.tree.slice(0, 60);
+  shown.forEach(t=>{
+    h += `<div class="tfolder" data-full="${escA(t.full)}" style="${plan.parent?'margin-left:18px':''}">`
+       + `<span class="ticon">📁</span><span class="tname">${esc(t.name)}</span>`
+       + (t.files.length ? `<span class="tcount">${t.files.length}개</span>` : ``)
+       + (t.exists ? `<span class="tbadge texist">이미 있음</span>` : `<span class="tbadge tnew">신규</span>`)
+       + `</div>`;
+    if(t.subs.length || t.files.length){
+      h += `<div class="tfiles" style="${plan.parent?'margin-left:42px':''}">`;
+      t.subs.forEach(sb=>{ h += `<div class="tsub"><span class="ticon">📁</span><span>${esc(sb)}</span></div>`; });
+      if(plan.moveOn) t.files.slice(0,LIM).forEach(fn=>{
+        h += `<div class="tfile"><span class="ticon">📄</span><span>${esc(fn)}</span></div>`; });
+      if(plan.moveOn && t.files.length>LIM) h += `<div class="tmore">+${t.files.length-LIM}개 더</div>`;
+      h += `</div>`;
+    }
+  });
+  if(plan.tree.length > shown.length) h += `<div class="tmore">+${plan.tree.length - shown.length}개 폴더 더</div>`;
+  h += `</div>`;
+  el.innerHTML = h;
+
+  const newCount = plan.tree.filter(t=>!t.exists).length;
+  const exist = plan.tree.length - newCount;
+  let t = `총 ${plan.dirs.length}개 폴더 생성`;
+  if(exist) t += ` · 이미 있는 ${exist}개는 건너뜀`;
+  if(plan.moves.length) t += ` · 파일 ${plan.moves.length}개 이동`;
+  info.textContent = t;
+
+  checkExisting(plan);   // 서버에 물어 '이미 있음' 배지를 정확히 표시
+  if(runBtn) runBtn.disabled = !state.folder || plan.dirs.length===0;
+  let msg = state.folder ? `만들 폴더 <b class="ok">${plan.dirs.length}</b>개`
+                         : `<span class="warn">폴더를 먼저 선택하세요</span>`;
+  if(plan.moves.length) msg += ` · 파일 <b>${plan.moves.length}</b>개 이동`;
+  if(plan.warn) msg += ` · <span class="warn">${esc(plan.warn)}</span>`;
+  setStatus(msg, false, true);
+}
+
+// 만들 폴더 중 이미 존재하는 것을 서버에 확인해 배지·요약만 살짝 고쳐 그린다
+let mkCheckTimer;
+function checkExisting(plan){
+  clearTimeout(mkCheckTimer);
+  if(!state.folder || !plan.tree.length) return;
+  const names = plan.tree.map(t=>t.full);
+  mkCheckTimer = setTimeout(async ()=>{
+    const res = await api("/api/checkdirs", {folder:state.folder, names});
+    if(res.error || !res.exists) return;
+    if(state.mkPlan !== plan) return;                  // 그 사이 입력이 바뀌었으면 무시
+    const have = new Set(res.exists);
+    plan.tree.forEach(t=>{ t.exists = have.has(t.full); });
+    document.querySelectorAll("#mkTree .tfolder[data-full]").forEach(el=>{
+      const on = have.has(el.dataset.full);
+      const b = el.querySelector(".tbadge");
+      if(!b || b.textContent==="상위") return;
+      b.textContent = on ? "이미 있음" : "신규";
+      b.className = "tbadge " + (on ? "texist" : "tnew");
+    });
+    const exist = plan.tree.filter(t=>t.exists).length;
+    let t = `총 ${plan.dirs.length}개 폴더 생성`;
+    if(exist) t += ` · 이미 있는 ${exist}개는 건너뜀`;
+    if(plan.moves.length) t += ` · 파일 ${plan.moves.length}개 이동`;
+    $("mkInfo").textContent = t;
+  }, 250);
+}
+
+function askMake(){
+  const plan = state.mkPlan || makePlan();
+  if(!state.folder || !plan.dirs.length) return;
+  let body = `<b>${plan.dirs.length}개</b> 폴더를 만듭니다. 이미 있는 폴더는 그대로 둡니다.`;
+  if(plan.moves.length) body += `<br>파일 <b>${plan.moves.length}개</b>도 새 폴더로 옮깁니다. (원본 파일은 삭제되지 않고 이동만 합니다)`;
+  body += `<br>실행 후에도 <b>실행 취소</b>로 한 번에 되돌릴 수 있습니다.`;
+  showDialog("폴더 만들기", body, "만들기", ()=>doMake(plan));
+}
+
+async function doMake(plan){
+  setStatus("폴더를 만드는 중…");
+  const res = await api("/api/mkdirs", {folder:state.folder, names:plan.dirs, moves:plan.moves});
+  if(res.error){ setStatus(res.error, true); return; }
+  $("btnUndo").disabled = !res.canUndo;
+  await reload();                      // 목록 갱신 → recompute → renderMake
+  let msg = `<b class="ok">폴더 ${res.made}개 생성 완료</b>`;
+  if(res.moved) msg += ` · 파일 ${res.moved}개 이동`;
+  if(res.skipped) msg += ` · 이미 있어 건너뜀 ${res.skipped}개`;
+  msg += ` · 실행 취소 가능`;
+  if(res.errors.length) msg += `<br><span class="warn">실패 ${res.errors.length}건: ${esc(res.errors.slice(0,3).join(" / "))}</span>`;
+  setStatus(msg, false, true);
+  addHistory("폴더 만들기",
+    `${res.made}개 생성` + (res.moved?` · ${res.moved}개 이동`:"") + (res.skipped?` · ${res.skipped}개 건너뜀`:"")
+    + (res.errors.length?` · 실패 ${res.errors.length}건`:""));
+}
+
+// ================= 임시저장 · 최근 사용 기억 · 이력 =================
+const PREF_KEY = "fileforge.prefs.v2";     // 마지막 폴더·탭 등 (묻지 않고 복원)
+const DRAFT_KEY = "fileforge.draft.v2";    // 입력한 규칙·목록 (복원 여부를 물어봄)
+const HIST_KEY = "fileforge.history.v2";   // 처리 이력
+
+function lsGet(k){ try{ return JSON.parse(localStorage.getItem(k)||"null"); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+
+function savePrefs(){
+  lsSet(PREF_KEY, {folder:state.folder, ext:$("extFilter").value, tab:state.tab,
+                   target:state.renameTarget, org:state.org, mkMode:state.mkMode});
+}
+function collectFields(){
+  const o = {};
+  document.querySelectorAll("#tab-rename input, #tab-rename select, #tab-make input, #tab-make textarea, #tab-make select")
+    .forEach(el=>{ if(el.id) o[el.id] = (el.type==="checkbox") ? el.checked : el.value; });
+  return o;
+}
+function draftSnapshot(){
+  return {t:Date.now(),
+          rules:[...document.querySelectorAll(".chip[data-rule]")].filter(c=>c.classList.contains("active")).map(c=>c.dataset.rule),
+          fields:collectFields(), keywords:state.keywords, mapRules:state.mapRules,
+          perText:state.perText, org:state.org, mkMode:state.mkMode, target:state.renameTarget};
+}
+function draftHasContent(d){
+  if(!d) return false;
+  if((d.rules||[]).length) return true;
+  if((d.keywords||[]).some(k=>(k||"").trim())) return true;
+  if((d.mapRules||[]).some(m=>(m.a||"").trim() || (m.b||"").trim())) return true;
+  const f = d.fields || {};
+  return ["mkList","mkComboA","mkComboB","mkParent","mkSubs","mkNumBase","mkDateFrom"]
+           .some(k=>String(f[k]||"").trim());
+}
+let saveTimer;
+function scheduleSave(){ clearTimeout(saveTimer); saveTimer = setTimeout(doSave, 600); }
+function doSave(){
+  const d = draftSnapshot();
+  lsSet(DRAFT_KEY, d); savePrefs();
+  const t = new Date(d.t), p = n=>String(n).padStart(2,"0");
+  $("savedAt").textContent = draftHasContent(d)
+    ? `자동저장됨 · ${p(t.getHours())}:${p(t.getMinutes())}` : "자동저장 대기 중";
+}
+function applyDraft(d){
+  const f = d.fields || {};
+  Object.keys(f).forEach(id=>{
+    const el = $(id); if(!el) return;
+    if(el.type==="checkbox") el.checked = !!f[id]; else el.value = f[id];
+  });
+  (d.rules||[]).forEach(r=>{
+    const c = document.querySelector('.chip[data-rule="'+r+'"]');
+    if(c && !c.classList.contains("active")){ c.classList.add("active"); $("panel-"+r).classList.add("show"); }
+  });
+  state.keywords = d.keywords || [];
+  state.mapRules = d.mapRules || [];
+  state.perText  = d.perText  || {};
+  if(state.keywords.length) renderKwFields();
+  if(state.mapRules.length) renderMapFields();
+  if(d.target){ state.renameTarget = d.target; if($("renameTarget")) $("renameTarget").value = d.target; }
+  if(d.org){ const c = document.querySelector('#orgChips .chip[data-org="'+d.org+'"]'); if(c) pickOrg(c); }
+  if(d.mkMode){ const c = document.querySelector('#mkChips .chip[data-mk="'+d.mkMode+'"]'); if(c) pickMk(c); }
+  onRebuildModeChange();
+}
+function clearDraft(){
+  showDialog("입력 초기화",
+    "입력해 둔 규칙·목록·텍스트를 모두 비웁니다. <b>파일은 전혀 바뀌지 않습니다.</b>",
+    "초기화", ()=>{ try{ localStorage.removeItem(DRAFT_KEY); }catch(e){} location.reload(); });
+}
+
+function addHistory(kind, summary){
+  const h = lsGet(HIST_KEY) || [];
+  h.unshift({t:Date.now(), kind, summary, folder:state.folder});
+  lsSet(HIST_KEY, h.slice(0,30));
+  renderHistory();
+}
+function renderHistory(){
+  const h = lsGet(HIST_KEY) || [];
+  const box = $("histRows"); if(!box) return;
+  if(!h.length){ box.innerHTML = '<div class="hint" style="padding:10px 0">아직 실행한 작업이 없습니다.</div>'; return; }
+  const p = n=>String(n).padStart(2,"0");
+  box.innerHTML = h.map(r=>{
+    const d = new Date(r.t);
+    return `<div class="hrow"><span class="htime">${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}</span>`
+      + `<span class="hkind">${esc(r.kind)}</span>`
+      + `<span>${esc(r.summary)}<br><span class="hint">${esc(r.folder||"")}</span></span></div>`;
+  }).join("");
+}
+
+// ================= 단축키 =================
+document.addEventListener("keydown", e=>{
+  const dlgOpen = $("scrim").classList.contains("show");
+  if(e.key === "Escape"){ if(dlgOpen) closeDialog(); return; }
+  if((e.ctrlKey || e.metaKey) && e.key === "Enter"){
+    e.preventDefault();
+    if(dlgOpen){ $("dlgOk").click(); return; }
+    if(state.tab === "pdf"){ if(!$("pdfRun").disabled) runPdfOp(); }
+    else if(!$("btnRun").disabled) askExecute();
+    return;
+  }
+  if((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z") && !e.shiftKey){
+    const t = e.target;
+    if(t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;  // 입력 중엔 글자 되돌리기
+    if(dlgOpen) return;
+    e.preventDefault();
+    if(!$("btnUndo").disabled) doUndo();
+  }
+});
+
+// ================= 시작 =================
+async function init(){
+  renderHistory();
+  const pref = lsGet(PREF_KEY), draft = lsGet(DRAFT_KEY);
+  if(pref){
+    if(pref.ext) $("extFilter").value = pref.ext;
+    if(pref.target){ state.renameTarget = pref.target; $("renameTarget").value = pref.target; }
+  }
+  document.addEventListener("input", scheduleSave);
+  document.addEventListener("change", scheduleSave);
+
+  const startup = async ()=>{
+    onTargetChange();                                  // 확장자 필터 활성/비활성 반영
+    if(pref && pref.folder){ state.folder = pref.folder; await reload(true); }
+    if(pref && pref.tab && pref.tab !== "rename") await switchTab(pref.tab);
+    else recompute();
+    doSave();
+  };
+
+  if(draftHasContent(draft)){
+    showDialog("이전 작업 내용이 있습니다",
+      "마지막으로 입력했던 규칙·목록이 저장되어 있습니다. 이어서 하시겠습니까?",
+      "이어서 하기", async ()=>{ applyDraft(draft); await startup(); },
+      "새로 시작", async ()=>{ try{ localStorage.removeItem(DRAFT_KEY); }catch(e){} await startup(); });
+  }else{
+    await startup();
+  }
+}
+window.addEventListener("DOMContentLoaded", init);
 
 // ================= PDF · 변환 도구 =================
 const PDF_EXTS = {
@@ -2293,7 +3028,8 @@ class Handler(BaseHTTPRequestHandler):
                     folder = body.get("folder", "")
                     if not os.path.isdir(folder):
                         return self._json({"error": "폴더를 찾을 수 없습니다: " + folder})
-                    files, all_names = list_files(folder, set(body.get("exts", [])))
+                    files, all_names = list_files(folder, set(body.get("exts", [])),
+                                                  body.get("include", "files"))
                     dirs = [n for n in all_names
                             if os.path.isdir(os.path.join(folder, n))]
                     return self._json({"files": files, "allNames": all_names, "dirs": dirs})
@@ -2308,9 +3044,37 @@ class Handler(BaseHTTPRequestHandler):
                                        "canUndo": bool(UNDO_STACK)})
 
                 if self.path == "/api/undo":
-                    restored, errors = undo_last()
+                    restored, errors, removed = undo_last()
                     return self._json({"restored": restored, "errors": errors,
+                                       "removedDirs": removed,
                                        "canUndo": bool(UNDO_STACK)})
+
+                if self.path == "/api/mkdirs":
+                    folder = body.get("folder", "")
+                    if not os.path.isdir(folder):
+                        return self._json({"error": "폴더를 먼저 선택하세요."})
+                    res = make_dirs(folder, body.get("names", []), body.get("moves", []))
+                    res["canUndo"] = bool(UNDO_STACK)
+                    return self._json(res)
+
+                if self.path == "/api/checkdirs":
+                    # 만들 예정인 경로 중 '이미 있는 폴더'를 알려준다 (미리보기 배지용)
+                    folder = body.get("folder", "")
+                    if not os.path.isdir(folder):
+                        return self._json({"exists": []})
+                    found = []
+                    for rel in (body.get("names", []) or [])[:2000]:
+                        try:
+                            p = safe_join(folder, (rel or "").strip().strip("/\\"))
+                        except ValueError:
+                            continue
+                        if os.path.isdir(p):
+                            found.append(rel)
+                    return self._json({"exists": found})
+
+                if self.path == "/api/open":
+                    open_in_explorer(body.get("folder", ""))
+                    return self._json({"ok": True})
 
                 # ----- PDF · 변환 도구 -----
                 folder = body.get("folder", "")
