@@ -8,9 +8,11 @@ FileForge — 파일 자동화 도구 (Windows 에디션, Nike 디자인 시스�
 실행 방법: Python 설치 후 이 파일을 더블클릭
 """
 
+import http.client
 import importlib
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -24,6 +26,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
+BASE_PORT = 8765          # 여기서부터 비어 있는 포트를 찾는다
 
 # ---------------- 파일 작업 로직 ----------------
 
@@ -39,6 +42,9 @@ _ARMED = False            # 브라우저가 최소 1번 연결됐는지(시작 �
 _SHUTTING = False         # 종료 절차 중복 실행 방지
 HEARTBEAT_TTL = 70        # ping이 없으면 이 초 뒤 탭 만료(백그라운드 스로틀 여유)
 CLOSE_GRACE = 3           # 닫힘 신호 후 유예(새로고침 재연결 대기 → 오종료 방지)
+ARM_TIMEOUT = 180         # 이 시간 안에 UI가 한 번도 안 열리면 스스로 종료(좀비 프로세스 방지)
+                          # 느린 PC에서 브라우저가 뜨는 시간을 넉넉히 감안한 값
+_START_TS = 0.0           # 서버 시작 시각
 
 
 def notify_shell_change(paths):
@@ -88,27 +94,34 @@ def list_files(folder, exts, include="files"):
     (폴더는 확장자가 없으므로 확장자 필터의 영향을 받지 않는다)"""
     want_files = include in ("files", "both")
     want_dirs = include in ("dirs", "both")
+    # scandir 은 디렉터리를 한 번 훑으면서 종류·수정시각을 함께 돌려준다.
+    # listdir + isdir + isfile + getmtime 은 항목마다 stat 을 3~4번 호출해서,
+    # 파일이 많은 폴더나 네트워크 드라이브에서 눈에 띄게 느렸다.
     items, all_names = [], []
-    for name in os.listdir(folder):
-        path = os.path.join(folder, name)
-        if name.startswith("."):
-            continue
-        all_names.append(name)
-        is_dir = os.path.isdir(path)
-        if is_dir:
-            if not want_dirs:
+    with os.scandir(folder) as it:
+        for entry in it:
+            name = entry.name
+            if name.startswith("."):
                 continue
-        else:
-            if not want_files or not os.path.isfile(path):
+            all_names.append(name)
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
                 continue
-            ext = os.path.splitext(name)[1].lower().lstrip(".")
-            if exts and ext not in exts:
-                continue
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = 0
-        items.append({"name": name, "mtime": mtime, "isDir": is_dir})
+            if is_dir:
+                if not want_dirs:
+                    continue
+            else:
+                if not want_files or not entry.is_file():
+                    continue
+                ext = os.path.splitext(name)[1].lower().lstrip(".")
+                if exts and ext not in exts:
+                    continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                mtime = 0
+            items.append({"name": name, "mtime": mtime, "isDir": is_dir})
     # 폴더를 먼저, 그 다음 파일 — 각각 사람이 보기 좋은 자연 정렬(숫자 순)
     items.sort(key=lambda f: (not f["isDir"], _natkey(f["name"])))
     return items, all_names
@@ -974,16 +987,41 @@ def excel_consolidate_rows(folder, files, out_name, skip_header=True):
             pass
 
 
+_TK_ROOT = None                    # 숨은 Tk 루트 — 매번 만들지 않고 재사용한다
+_DIALOG_REQ = queue.Queue()        # 워커 스레드 → 메인 스레드 다이얼로그 요청 통로
+_DIALOG_READY = threading.Event()  # 메인 스레드 디스패처가 돌고 있는지
+
+
 def _show_folder_dialog():
     """tkinter 폴더 선택 다이얼로그를 띄우고 선택 경로(문자열)를 돌려준다.
     반드시 자신을 소유한 스레드(메인 스레드 권장)에서 호출할 것."""
+    global _TK_ROOT
     import tkinter as tk
     from tkinter import filedialog
-    r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)
-    try:
-        return filedialog.askdirectory(title='대상 폴더를 선택하세요') or ''
-    finally:
-        r.destroy()
+    if _TK_ROOT is None:
+        _TK_ROOT = tk.Tk()
+        _TK_ROOT.withdraw()
+    _TK_ROOT.attributes('-topmost', True)
+    return filedialog.askdirectory(title='대상 폴더를 선택하세요') or ''
+
+
+def _dialog_dispatcher():
+    """메인 스레드에서 돌면서 폴더 선택 요청만 처리한다.
+
+    Tk 는 자신을 만든 스레드에서만 다뤄야 해서 HTTP 워커 스레드가 직접 띄울 수
+    없다. 예전에는 exe 자신을 다시 실행해 다이얼로그를 띄웠는데, onefile exe 는
+    실행할 때마다 50MB를 임시폴더에 다시 푸느라 5초 넘게 걸렸다. 지금은 이미
+    떠 있는 프로세스의 메인 스레드가 곧바로 띄운다."""
+    _DIALOG_READY.set()
+    while not STOP.is_set():
+        try:
+            resp = _DIALOG_REQ.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            resp.put(_show_folder_dialog())
+        except Exception:      # 다이얼로그 실패가 서버를 멈추게 하지는 않는다
+            resp.put("")
 
 
 def _pick_folder_via_self():
@@ -1010,12 +1048,21 @@ def _pick_folder_via_self():
 
 
 def pick_folder_native():
-    """폴더 선택 다이얼로그.
+    """폴더 선택 다이얼로그 (HTTP 워커 스레드에서 호출된다).
 
-    - 스크립트(.pyw) 실행 시: 별도 파이썬 프로세스로 띄워 서버와 충돌 방지
-    - PyInstaller exe 실행 시: sys.executable 이 파이썬이 아니라 exe 자기 자신이라
-      `-c` 코드를 넘기는 방식이 동작하지 않음 → exe 자신을 특수 모드로 재실행한다.
+    메인 스레드 디스패처가 돌고 있으면 같은 프로세스 안에서 곧바로 띄운다.
+    디스패처가 없을 때만 예전 방식(별도 프로세스)으로 되돌아간다.
     """
+    if _DIALOG_READY.is_set():
+        resp = queue.Queue(1)
+        _DIALOG_REQ.put(resp)
+        try:
+            picked = resp.get(timeout=600)
+        except queue.Empty:
+            return None
+        picked = (picked or "").strip().rstrip("/")
+        return picked.replace("/", os.sep) if picked else None
+
     if getattr(sys, "frozen", False):
         return _pick_folder_via_self()
     code = (
@@ -1381,9 +1428,10 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
     <div class="panel" id="panel-mapname">
       <h3>키워드별 지정값으로 변경 — 기존 이름이 왼쪽 값과 <b>정확히 같으면</b> 오른쪽 값으로 바꿉니다</h3>
       <p class="hint" style="margin-bottom:12px">확장자는 그대로 유지됩니다. 예) 왼쪽 <b>1</b> → 오른쪽 <b>1_이력서</b> 로 두면 <b>1.pdf</b> 가 <b>1_이력서.pdf</b> 로 바뀝니다.
-        빈 칸·매칭 안 되는 파일은 그대로 둡니다. 입력칸에서 <b>Enter</b>를 누르면 아래에 줄이 추가됩니다.</p>
+        빈 칸·매칭 안 되는 파일은 그대로 둡니다. 입력칸에서 <b>Enter</b>를 누르면 같은 칸의 <b>아랫줄</b>로 내려가고
+        (마지막 줄이면 새 줄이 생깁니다), <b>Ctrl+Enter</b>는 그 자리 아래에 줄을 하나 끼워 넣습니다.</p>
       <div id="mapFields"></div>
-      <button class="btn btn-secondary btn-sm" onclick="addMapRow(true)">＋ 줄 추가</button>
+      <button class="btn btn-secondary btn-sm" onclick="addMapRow()">＋ 줄 추가</button>
     </div>
     <div class="panel" id="panel-replace">
       <h3>찾기 / 바꾸기</h3>
@@ -1818,24 +1866,45 @@ function renderMapFields(){
   state.mapRules.forEach((m,i)=>{
     h += `<div class="maprow"><span class="mapnum">${i+1}</span>
       <input class="field" value="${escA(m.a)}" placeholder="기존 이름 (예: 1)"
-             oninput="onMapInput(${i},'a',this.value)" onkeydown="onMapKey(event,${i})">
+             oninput="onMapInput(${i},'a',this.value)" onkeydown="onMapKey(event,${i},'a')">
       <span class="maparrow">→</span>
       <input class="field" value="${escA(m.b)}" placeholder="바꿀 이름 (예: 1_이력서)"
-             oninput="onMapInput(${i},'b',this.value)" onkeydown="onMapKey(event,${i})">
+             oninput="onMapInput(${i},'b',this.value)" onkeydown="onMapKey(event,${i},'b')">
       <button class="mapdel" onclick="removeMapRow(${i})" title="삭제">×</button></div>`;
   });
   $("mapFields").innerHTML = h;
 }
 function onMapInput(i, key, val){ state.mapRules[i][key] = val; recompute(); }
-function onMapKey(e, i){ if(e.key==="Enter"){ e.preventDefault(); addMapRow(true); } }
-function addMapRow(focusNew){
-  state.mapRules.push({a:"", b:""});
-  renderMapFields(); recompute();
-  if(focusNew){
-    const rows = $("mapFields").querySelectorAll(".maprow");
-    const last = rows[rows.length-1];
-    if(last){ const inp = last.querySelector("input"); if(inp) inp.focus(); }
+// i번째 줄의 'a'(왼쪽)/'b'(오른쪽) 칸으로 커서를 옮긴다
+function focusMapCell(i, key){
+  const row = $("mapFields").querySelectorAll(".maprow")[i];
+  if(!row) return;
+  const inp = row.querySelectorAll("input")[key === "b" ? 1 : 0];
+  if(inp) inp.focus();
+}
+function onMapKey(e, i, key){
+  if(e.key !== "Enter") return;
+  // 한글 등 조합 입력 중의 Enter 는 '조합 확정'용이다. 여기서 가로채면 마지막 글자가
+  // 확정되지 않은 채 넘어갈 수 있으므로, 확정용 Enter 는 그대로 흘려보낸다.
+  if(e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  // Ctrl+Enter 는 전역에서 '실행'에 걸려 있다. 입력칸 안에서는 줄 추가로만 쓰고
+  // 전역 핸들러까지 올라가지 않도록 여기서 막는다.
+  e.stopPropagation();
+  if(e.ctrlKey || e.metaKey){          // Ctrl+Enter: 이 줄 바로 아래에 새 줄
+    addMapRow(i + 1, key);
+    return;
   }
+  if(i + 1 >= state.mapRules.length)   // Enter: 아랫줄로. 마지막 줄이면 이어서 칠 수 있게 늘린다
+    addMapRow(i + 1, key);
+  else
+    focusMapCell(i + 1, key);
+}
+function addMapRow(at, key){
+  const idx = (typeof at === "number") ? at : state.mapRules.length;
+  state.mapRules.splice(idx, 0, {a:"", b:""});
+  renderMapFields(); recompute();
+  focusMapCell(idx, key || "a");
 }
 function removeMapRow(i){
   state.mapRules.splice(i,1);
@@ -2957,7 +3026,8 @@ function _heartbeat(){
                       body:JSON.stringify({tab:_TAB_ID}), keepalive:true}).catch(()=>{});
 }
 _heartbeat();
-setInterval(_heartbeat, 2000);
+// TTL 이 70초라 15초면 충분하다. 탭을 닫을 때는 아래 sendBeacon 으로 즉시 알린다.
+setInterval(_heartbeat, 15000);
 function _bye(){
   try{ navigator.sendBeacon("/api/quit", JSON.stringify({tab:_TAB_ID})); }catch(e){}
 }
@@ -2971,7 +3041,15 @@ window.addEventListener("beforeunload", _bye);
 
 # ---------------- HTTP 서버 ----------------
 
+PAGE_BYTES = PAGE.encode("utf-8")   # 요청마다 90KB를 다시 인코딩하지 않도록 한 번만 변환
+
+
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 = keep-alive. 예전에는 하트비트마다 TCP 연결을 새로 맺어
+    # TIME_WAIT 소켓이 수십 개씩 쌓였다. (모든 응답에 Content-Length 를 붙이고 있음)
+    protocol_version = "HTTP/1.1"
+    timeout = 30                    # 유휴 연결이 워커 스레드를 계속 붙잡지 않도록
+
     def log_message(self, *args):
         pass  # 콘솔 로그 생략
 
@@ -2984,8 +3062,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/api/hello":   # 중복 실행 감지용 서명
+            return self._json({"app": "fileforge"})
         if self.path in ("/", "/index.html"):
-            data = PAGE.encode("utf-8")
+            data = PAGE_BYTES
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -3129,11 +3209,86 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"처리 중 오류: {e}"}, 200)
 
 
-def _maybe_shutdown():
-    """열린 UI(탭)가 하나도 없으면 서버를 정상 종료시킨다."""
+class _Server(ThreadingHTTPServer):
+    """중복 바인딩을 막는 HTTP 서버.
+
+    윈도우의 SO_REUSEADDR 는 리눅스와 달리 "이미 다른 프로세스가 듣고 있는
+    포트에 또 바인딩하는 것"까지 허용한다. HTTPServer 는 이 옵션을 기본으로
+    켜기 때문에, FileForge 를 두 번 실행하면 두 인스턴스가 같은 8765 포트에
+    동시에 붙어 요청이 어느 쪽으로 갈지 알 수 없는 상태가 됐다."""
+    daemon_threads = True      # 요청 처리 스레드가 종료를 막지 않도록
+    allow_reuse_address = False
+    exclusive = True
+
+    def server_bind(self):
+        if self.exclusive and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+class _ReuseServer(_Server):
+    """직전 인스턴스가 남긴 TIME_WAIT 소켓 때문에 바인딩이 막혔을 때만 쓰는 완화 버전.
+    (듣고 있는 프로세스가 없다고 먼저 확인한 뒤에만 사용한다)"""
+    allow_reuse_address = True
+    exclusive = False
+
+
+def _port_listening(port):
+    """이 포트에서 실제로 듣고 있는 프로세스가 있는지 확인."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.settimeout(0.3)
+        return sk.connect_ex((HOST, port)) == 0
+
+
+def _is_fileforge(port):
+    """그 포트를 쓰는 게 이미 실행 중인 FileForge 인지 확인."""
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(HOST, port, timeout=0.5)
+        conn.request("GET", "/api/hello")
+        res = conn.getresponse()
+        return res.status == 200 and json.loads(res.read(200) or b"{}").get("app") == "fileforge"
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def open_server():
+    """비어 있는 포트에 서버를 연다.
+
+    반환: (서버, 포트). 이미 FileForge 가 떠 있으면 (None, 그 포트) — 새로 띄우지 않고
+    기존 화면만 열어주기 위함이다."""
+    last_err = None
+    for port in range(BASE_PORT, BASE_PORT + 20):
+        if _port_listening(port):
+            if _is_fileforge(port):
+                return None, port      # 이미 실행 중 → 그 창을 열어준다
+            continue                   # 다른 프로그램이 쓰는 포트 → 건너뛴다
+        try:
+            return _Server((HOST, port), Handler), port
+        except OSError as e:
+            last_err = e
+            try:
+                # 듣는 프로세스는 없는데 막혔다면 직전 인스턴스의 TIME_WAIT 소켓 탓이다
+                return _ReuseServer((HOST, port), Handler), port
+            except OSError as e2:
+                last_err = e2
+    raise SystemExit(f"사용 가능한 포트를 찾지 못했습니다. ({last_err})")
+
+
+def _shutdown_now():
+    """서버 루프를 멈춰 프로세스 종료 절차를 시작한다."""
     global _SHUTTING
     with TABS_LOCK:
-        if _SHUTTING or not _ARMED or ACTIVE_TABS:
+        if _SHUTTING:
             return
         _SHUTTING = True
     STOP.set()
@@ -3143,6 +3298,14 @@ def _maybe_shutdown():
         threading.Thread(target=srv.shutdown, daemon=True).start()
 
 
+def _maybe_shutdown():
+    """열린 UI(탭)가 하나도 없으면 서버를 정상 종료시킨다."""
+    with TABS_LOCK:
+        if _SHUTTING or not _ARMED or ACTIVE_TABS:
+            return
+    _shutdown_now()
+
+
 def _watchdog():
     """만료된 탭을 걷어내고, 남은 탭이 없으면 종료를 트리거하는 데몬 스레드."""
     while not STOP.wait(1.0):
@@ -3150,11 +3313,16 @@ def _watchdog():
         with TABS_LOCK:
             for tid in [t for t, exp in ACTIVE_TABS.items() if exp <= now]:
                 del ACTIVE_TABS[tid]
+        # 브라우저가 한 번도 열리지 않으면 종료 조건(_ARMED)이 영영 안 걸려서
+        # 프로세스가 계속 남는다. 그 경우도 스스로 정리하게 한다.
+        if not _ARMED and now - _START_TS > ARM_TIMEOUT:
+            _shutdown_now()
+            return
         _maybe_shutdown()
 
 
 def main():
-    global SERVER
+    global SERVER, _START_TS
     # frozen exe 특수 모드: 폴더 다이얼로그만 띄우고 결과를 파일로 남긴 뒤 종료
     pick_out = os.environ.get("FILEFORGE_PICK_OUT")
     if pick_out:
@@ -3169,34 +3337,37 @@ def main():
             pass
         return
 
-    port = 8765
-    for _ in range(20):
-        try:
-            server = ThreadingHTTPServer((HOST, port), Handler)
-            break
-        except OSError:
-            port += 1
-    else:
-        raise SystemExit("사용 가능한 포트를 찾지 못했습니다.")
-
-    server.daemon_threads = True   # 요청 처리 차일드 스레드가 종료를 막지 않도록
-    SERVER = server
-
+    server, port = open_server()
     url = f"http://{HOST}:{port}/"
+
+    if server is None:
+        # 이미 FileForge 가 떠 있다 → 두 번째 서버를 띄우지 않고 그 화면만 열어준다
+        webbrowser.open(url)
+        return
+
+    SERVER = server
+    _START_TS = time.time()
+
     if sys.stdout:  # .pyw(콘솔 없음)로 실행하면 stdout이 없음
         print(f"FileForge 실행 중 → {url}")
         print("브라우저 탭을 닫으면 자동으로 종료됩니다. (Ctrl+C 로도 종료)")
 
-    threading.Thread(target=_watchdog, daemon=True).start()  # UI 종료 감시
+    threading.Thread(target=_watchdog, daemon=True).start()          # UI 종료 감시
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     opener = threading.Timer(0.4, lambda: webbrowser.open(url))
     opener.daemon = True
     opener.start()
     try:
-        server.serve_forever()
+        # 메인 스레드는 폴더 선택 다이얼로그 전담. STOP 이 걸리면 루프가 끝난다.
+        _dialog_dispatcher()
     except KeyboardInterrupt:
         pass
     finally:
         # 소켓·서버 자원 해제 후, 남은 스레드까지 확실히 정리하고 프로세스 종료
+        try:
+            server.shutdown()
+        except Exception:
+            pass
         try:
             server.server_close()
         except Exception:
