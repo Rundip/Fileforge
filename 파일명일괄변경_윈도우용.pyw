@@ -1622,7 +1622,7 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
       <h3>이름 새로 입력 — 기존 이름을 지우고 통째로 새 값을 넣습니다</h3>
       <div class="row">
         <select class="field" id="rebuildMode" onchange="onRebuildModeChange()">
-          <option value="number">숫자 순번 (001, 002, 003…)</option>
+          <option value="number">숫자 순번 (1, 2, 3… 자릿수 선택)</option>
           <option value="common">공통 이름 (겹치면 _1, _2, _3…)</option>
           <option value="perfile">파일별 입력 (직접 / 드래그 / 붙여넣기)</option>
         </select>
@@ -1632,8 +1632,9 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
         <input class="field" id="rebuildBase" placeholder="앞에 붙일 이름 (선택)" oninput="recompute()">
         <span class="hint">시작 번호</span>
         <input class="field narrow" id="rebuildStart" type="number" value="1" min="0" oninput="recompute()">
-        <span class="hint">자릿수</span>
+        <span class="hint">자릿수 (앞에 0 채우기)</span>
         <input class="field narrow" id="rebuildPad" type="number" value="3" min="1" max="6" oninput="recompute()">
+        <span class="hint" id="rebuildPadEx"></span>
       </div>
       <div class="row" id="rebuildCommonOpts" style="display:none">
         <input class="field" id="rebuildCommon" placeholder="모든 파일에 넣을 이름 (예: 보고서)" oninput="recompute()">
@@ -1719,7 +1720,8 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
         <input class="field narrow" id="seqStart" type="number" value="1" min="0" oninput="recompute()">
         <span class="hint">시작 번호</span>
         <input class="field narrow" id="seqPad" type="number" value="2" min="1" max="6" oninput="recompute()">
-        <span class="hint">자릿수</span>
+        <span class="hint">자릿수 (앞에 0 채우기)</span>
+        <span class="hint" id="seqPadEx"></span>
         <select class="field" id="seqPos" onchange="recompute()">
           <option value="front">앞에</option><option value="back">뒤에</option>
         </select>
@@ -2433,8 +2435,32 @@ function onRebuildModeChange(){
   recompute();
 }
 
+// 자릿수를 바꾸면 번호가 어떻게 나오는지 옆에 바로 보여준다.
+// 자릿수 1 이면 0 없이 1, 2, 3… 이 된다.
+function _padOf(id){
+  const el = $(id);
+  // 실제 이름을 만들 때와 똑같은 계산을 써야 예시와 결과가 어긋나지 않는다
+  return el ? Math.max(1, parseInt(el.value) || 1) : 1;
+}
+function updatePadExamples(){
+  const rex = $("rebuildPadEx");
+  if(rex){
+    const base = ($("rebuildBase") && $("rebuildBase").value) || "";
+    const start = parseInt($("rebuildStart") && $("rebuildStart").value) || 0;
+    const pad = _padOf("rebuildPad");
+    rex.textContent = "예) " + [0,1,2].map(i=>base + String(start+i).padStart(pad,"0")).join(", ") + "…";
+  }
+  const sex = $("seqPadEx");
+  if(sex){
+    const start = parseInt($("seqStart") && $("seqStart").value) || 0;
+    const pad = _padOf("seqPad");
+    sex.textContent = "예) " + [0,1,2].map(i=>String(start+i).padStart(pad,"0")).join(", ") + "…";
+  }
+}
+
 // 전체 재계산 + 표 전체 다시 그리기 (규칙 토글·폴더 로드·포함 전환 등)
 function recompute(){
+  updatePadExamples();
   if(state.tab==="make"){ renderMake(); return; }   // 폴더 만들기 탭은 별도 미리보기
   document.body.classList.toggle("textcol", state.tab!=="organize" && (ruleOn("pertext") || rebuildPerfileOn()));
   computePreview();
