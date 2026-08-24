@@ -1341,10 +1341,38 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
 #histBox summary::-webkit-details-marker{display:none}
 #histBox summary::before{content:"▸ ";color:var(--mute)}
 #histBox[open] summary::before{content:"▾ "}
-.hrow{display:grid;grid-template-columns:150px 110px 1fr;gap:12px;padding:8px 0;
+.hrow{display:grid;grid-template-columns:150px 110px 1fr auto;gap:12px;padding:8px 0;
   border-bottom:1px solid var(--hairline-soft);font-size:13px}
 .hrow .htime{color:var(--mute);font-weight:500}
 .hrow .hkind{font-weight:500}
+.hrow .gobtn{align-self:center}
+@media (max-width:960px){          /* 좁은 화면: 버튼을 아랫줄로 내린다 */
+  .hrow{grid-template-columns:110px 90px 1fr}
+  .hrow .gobtn{grid-column:1/-1;justify-self:start;margin:4px 0 0}
+}
+
+/* ===== 작업한 폴더로 이동 ===== */
+.gobtn{border:1px solid var(--hairline);background:var(--canvas);color:var(--ink);
+  border-radius:999px;height:26px;padding:0 12px;font-size:12px;font-weight:500;
+  cursor:pointer;white-space:nowrap;vertical-align:middle;margin-left:4px}
+.gobtn:hover{background:var(--cloud)}
+.recent-wrap{position:relative}
+.recent-menu{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:60;
+  min-width:min(300px,calc(100vw - 48px));max-width:min(560px,calc(100vw - 48px));
+  background:var(--canvas);
+  border:1px solid var(--hairline);border-radius:12px;padding:6px;
+  box-shadow:0 12px 32px rgba(0,0,0,.14)}
+.recent-menu.show{display:block}
+.recent-item{display:block;width:100%;text-align:left;background:none;border:0;cursor:pointer;
+  padding:9px 12px;border-radius:8px;font-size:13px;color:var(--ink);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recent-item:hover{background:var(--cloud)}
+.recent-empty{padding:10px 12px;font-size:13px;color:var(--mute)}
+@media (max-width:960px){
+  /* 좁은 화면에선 nav 가 줄바꿈돼 버튼이 가운데로 온다. 버튼 오른쪽 끝에 맞추면
+     메뉴가 화면 밖으로 넘치므로, 화면 좌우 여백에 맞춰 편다. */
+  .recent-menu{position:fixed;left:24px;right:24px;min-width:0;max-width:none}
+}
 </style>
 </head>
 <body>
@@ -1364,6 +1392,11 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
   <input id="extFilter" class="search-pill" placeholder="확장자 필터 (jpg,png)"
          oninput="debounceReload()">
   <button class="btn btn-primary btn-sm" onclick="pickFolder()">폴더 선택</button>
+  <div class="recent-wrap">
+    <button class="btn btn-secondary btn-sm" onclick="toggleRecent(event)"
+            title="최근에 작업한 폴더를 탐색기에서 엽니다">최근 폴더 ▾</button>
+    <div class="recent-menu" id="recentMenu"></div>
+  </div>
 </nav>
 
 <div class="hero">
@@ -2373,6 +2406,7 @@ async function doExecute(jobs, organize){
   await reload();
   let msg = `<b class="ok">${res.done}개 ${organize?"이동":"이름 변경"} 완료</b> · 실행 취소 가능`;
   if(res.errors.length) msg += ` · <span class="warn">실패 ${res.errors.length}건: ${esc(res.errors[0])}</span>`;
+  msg += ` <button class="gobtn" onclick="openFolder()">탐색기에서 열기</button>`;
   setStatus(msg, false, true);
   addHistory(organize ? "폴더 정리" : "이름 변경",
              `${res.done}개 성공` + (res.errors.length ? ` · 실패 ${res.errors.length}건` : ""));
@@ -2391,11 +2425,49 @@ async function doUndo(){
 }
 
 // 결과를 바로 확인할 수 있게 탐색기(Finder)에서 폴더 열기
-async function openFolder(){
-  if(!state.folder) return;
-  const res = await api("/api/open", {folder:state.folder});
-  if(res.error) setStatus(res.error, true);
+async function openPath(folder){
+  if(!folder) return;
+  const res = await api("/api/open", {folder});
+  if(res.error) setStatus(res.error, true);   // 폴더가 지워졌거나 옮겨진 경우
 }
+async function openFolder(){ return openPath(state.folder); }
+
+// 이력에 남은 '그때 작업한 폴더' 열기 (경로를 HTML 에 심지 않고 번호로 찾는다)
+function openHist(i){
+  const h = lsGet(HIST_KEY) || [];
+  if(h[i]) openPath(h[i].folder);
+}
+
+// 이력에서 폴더만 중복 없이 최신순으로 뽑는다
+function recentFolders(n){
+  const h = lsGet(HIST_KEY) || [];
+  const seen = new Set(), out = [];
+  for(const r of h){
+    const f = (r.folder || "").trim();
+    if(!f || seen.has(f)) continue;
+    seen.add(f); out.push(f);
+    if(out.length >= (n || 8)) break;
+  }
+  return out;
+}
+function toggleRecent(e){
+  e.stopPropagation();                 // 아래 document 리스너가 곧바로 닫지 않도록
+  const menu = $("recentMenu");
+  const list = recentFolders(8);
+  menu.innerHTML = list.length
+    ? list.map((f,i)=>`<button class="recent-item" onclick="openRecent(${i})" title="${escA(f)}">${esc(f)}</button>`).join("")
+    : '<div class="recent-empty">아직 작업한 폴더가 없습니다.</div>';
+  menu.classList.toggle("show");
+}
+function openRecent(i){
+  const f = recentFolders(8)[i];
+  $("recentMenu").classList.remove("show");
+  openPath(f);
+}
+document.addEventListener("click", ()=>{
+  const m = $("recentMenu");
+  if(m) m.classList.remove("show");   // 바깥을 클릭하면 닫는다
+});
 
 // ================= 폴더 만들기 =================
 function pickMk(chip){
@@ -2637,6 +2709,7 @@ async function doMake(plan){
   if(res.skipped) msg += ` · 이미 있어 건너뜀 ${res.skipped}개`;
   msg += ` · 실행 취소 가능`;
   if(res.errors.length) msg += `<br><span class="warn">실패 ${res.errors.length}건: ${esc(res.errors.slice(0,3).join(" / "))}</span>`;
+  msg += ` <button class="gobtn" onclick="openFolder()">탐색기에서 열기</button>`;
   setStatus(msg, false, true);
   addHistory("폴더 만들기",
     `${res.made}개 생성` + (res.moved?` · ${res.moved}개 이동`:"") + (res.skipped?` · ${res.skipped}개 건너뜀`:"")
@@ -2722,11 +2795,14 @@ function renderHistory(){
   const box = $("histRows"); if(!box) return;
   if(!h.length){ box.innerHTML = '<div class="hint" style="padding:10px 0">아직 실행한 작업이 없습니다.</div>'; return; }
   const p = n=>String(n).padStart(2,"0");
-  box.innerHTML = h.map(r=>{
+  box.innerHTML = h.map((r,i)=>{
     const d = new Date(r.t);
     return `<div class="hrow"><span class="htime">${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}</span>`
       + `<span class="hkind">${esc(r.kind)}</span>`
-      + `<span>${esc(r.summary)}<br><span class="hint">${esc(r.folder||"")}</span></span></div>`;
+      + `<span>${esc(r.summary)}<br><span class="hint">${esc(r.folder||"")}</span></span>`
+      + (r.folder ? `<button class="gobtn" onclick="openHist(${i})" title="${escA(r.folder)}">탐색기에서 열기</button>`
+                  : `<span></span>`)
+      + `</div>`;
   }).join("");
 }
 
