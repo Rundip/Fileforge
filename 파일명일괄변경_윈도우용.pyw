@@ -127,14 +127,23 @@ def list_files(folder, exts, include="files"):
     return items, all_names
 
 
-def execute_jobs(folder, jobs, mode):
-    """jobs: [{"src": 파일명, "dst": 상대경로}] — 검증 후 실행, undo 배치 반환"""
+def execute_jobs(folder, jobs, mode, folders=None):
+    """jobs: [{"src": 파일명, "dst": 상대경로, "d": 폴더번호}] — 검증 후 실행, undo 배치 반환
+
+    folders 를 주면 각 job 의 "d" 가 가리키는 폴더를 기준으로 삼는다.
+    (키워드별 지정값으로 변경을 여러 폴더에 한꺼번에 적용할 때 사용)"""
     resolved = []
     for j in jobs:
         src = j["src"]
         if os.sep in src or src in (".", ".."):
             raise ValueError(f"잘못된 파일명: {src}")
-        resolved.append((safe_join(folder, src), safe_join(folder, j["dst"])))
+        base = folder
+        if folders:
+            try:
+                base = folders[int(j.get("d", 0))]
+            except (TypeError, ValueError, IndexError):
+                raise ValueError(f"폴더 지정이 잘못되었습니다: {src}")
+        resolved.append((safe_join(base, src), safe_join(base, j["dst"])))
 
     batch, made_dirs, errors = [], [], []
     if mode == "organize":
@@ -177,7 +186,7 @@ def execute_jobs(folder, jobs, mode):
 
     if batch:
         UNDO_STACK.append({"moves": batch, "dirs": made_dirs})
-    dirs = {folder}
+    dirs = set(folders) if folders else {folder}
     for dst, src in batch:
         dirs.add(os.path.dirname(dst))
         dirs.add(os.path.dirname(src))
@@ -1005,6 +1014,96 @@ def _show_folder_dialog():
     return filedialog.askdirectory(title='대상 폴더를 선택하세요') or ''
 
 
+# ---------- 여러 폴더를 한 번에 고르기 (Windows IFileOpenDialog) ----------
+# tkinter 의 폴더 선택창은 한 번에 하나만 고를 수 있다. 윈도우 기본 파일 대화상자를
+# '폴더 선택 + 다중 선택' 모드로 열면 탐색기처럼 드래그·Ctrl 클릭으로 여러 폴더를
+# 한꺼번에 고를 수 있어, COM 인터페이스를 직접 호출한다.
+_FOS_PICKFOLDERS      = 0x00000020
+_FOS_FORCEFILESYSTEM  = 0x00000040
+_FOS_ALLOWMULTISELECT = 0x00000200
+_SIGDN_FILESYSPATH    = 0x80058000
+
+
+def _com_call(ptr, index, restype, argtypes, *args):
+    """COM 객체 vtable 의 index 번째 메서드를 호출한다."""
+    import ctypes
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    fn = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+    return fn(ptr, *args)
+
+
+def _show_multi_folder_dialog():
+    """폴더를 여러 개 고르는 대화상자. 취소하면 빈 목록을 돌려준다.
+
+    윈도우가 아니거나 대화상자를 못 여는 환경에서는 기존 단일 선택창으로 물러난다."""
+    if os.name != "nt":
+        one = _show_folder_dialog()
+        return [one] if one else []
+
+    import ctypes
+    from ctypes import POINTER, byref, c_void_p, c_uint, c_ulong, c_ushort, c_ubyte, c_wchar_p
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", c_ulong), ("Data2", c_ushort),
+                    ("Data3", c_ushort), ("Data4", c_ubyte * 8)]
+
+    ole32 = ctypes.OleDLL("ole32")
+    HR = ctypes.HRESULT
+
+    def guid(text):
+        g = GUID()
+        ole32.CLSIDFromString(text, byref(g))
+        return g
+
+    try:
+        ole32.CoInitialize(None)
+    except OSError:
+        pass                      # 이미 초기화된 스레드면 그대로 쓴다
+
+    dlg = c_void_p()
+    ole32.CoCreateInstance(byref(guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")),  # FileOpenDialog
+                           None, 1,
+                           byref(guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")),  # IFileOpenDialog
+                           byref(dlg))
+    try:
+        opts = c_uint()
+        _com_call(dlg, 10, HR, [POINTER(c_uint)], byref(opts))            # GetOptions
+        _com_call(dlg, 9, HR, [c_uint],                                   # SetOptions
+                  opts.value | _FOS_PICKFOLDERS | _FOS_FORCEFILESYSTEM | _FOS_ALLOWMULTISELECT)
+        _com_call(dlg, 17, HR, [c_wchar_p],                               # SetTitle
+                  "폴더를 여러 개 선택하세요 — 드래그하거나 Ctrl 을 누른 채 클릭")
+        _com_call(dlg, 18, HR, [c_wchar_p], "이 폴더들 선택")              # SetOkButtonLabel
+        try:
+            _com_call(dlg, 3, HR, [c_void_p], None)                       # Show
+        except OSError as e:
+            if (e.winerror or 0) & 0xFFFF == 1223:                        # 사용자가 취소함
+                return []
+            raise
+        arr = c_void_p()
+        _com_call(dlg, 27, HR, [POINTER(c_void_p)], byref(arr))           # GetResults
+        try:
+            count = c_uint()
+            _com_call(arr, 7, HR, [POINTER(c_uint)], byref(count))        # GetCount
+            picked = []
+            for i in range(count.value):
+                item = c_void_p()
+                _com_call(arr, 8, HR, [c_uint, POINTER(c_void_p)], i, byref(item))   # GetItemAt
+                try:
+                    name = c_wchar_p()
+                    _com_call(item, 5, HR, [c_ulong, POINTER(c_wchar_p)],             # GetDisplayName
+                              _SIGDN_FILESYSPATH, byref(name))
+                    if name.value:
+                        picked.append(name.value)
+                        ole32.CoTaskMemFree(name)
+                finally:
+                    _com_call(item, 2, c_ulong, [])                        # Release
+            return picked
+        finally:
+            _com_call(arr, 2, c_ulong, [])
+    finally:
+        _com_call(dlg, 2, c_ulong, [])
+
+
 def _dialog_dispatcher():
     """메인 스레드에서 돌면서 폴더 선택 요청만 처리한다.
 
@@ -1015,13 +1114,13 @@ def _dialog_dispatcher():
     _DIALOG_READY.set()
     while not STOP.is_set():
         try:
-            resp = _DIALOG_REQ.get(timeout=0.5)
+            kind, resp = _DIALOG_REQ.get(timeout=0.5)
         except queue.Empty:
             continue
         try:
-            resp.put(_show_folder_dialog())
+            resp.put(_show_multi_folder_dialog() if kind == "multi" else _show_folder_dialog())
         except Exception:      # 다이얼로그 실패가 서버를 멈추게 하지는 않는다
-            resp.put("")
+            resp.put([] if kind == "multi" else "")
 
 
 def _pick_folder_via_self():
@@ -1047,6 +1146,82 @@ def _pick_folder_via_self():
     return picked.replace("/", os.sep) if picked else None
 
 
+def _ask_dialog(kind, on_timeout):
+    """메인 스레드 디스패처에 대화상자를 요청하고 결과를 기다린다."""
+    resp = queue.Queue(1)
+    _DIALOG_REQ.put((kind, resp))
+    try:
+        return resp.get(timeout=600)
+    except queue.Empty:
+        return on_timeout
+
+
+def pick_folders_native():
+    """폴더 여러 개를 한 번에 고른다. 정리된 절대경로 목록을 돌려준다."""
+    if not _DIALOG_READY.is_set():
+        one = pick_folder_native()
+        return [one] if one else []
+    picked = _ask_dialog("multi", []) or []
+    out, seen = [], set()
+    for p in picked:
+        p = (p or "").strip().rstrip("/").replace("/", os.sep)
+        if not p or not os.path.isdir(p):
+            continue
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(os.path.abspath(p))
+    return out
+
+
+def map_scan(folders, rules):
+    """선택한 폴더들에서 매핑 규칙에 걸리는 파일을 찾아 바뀔 이름을 계산한다.
+
+    화면(자바스크립트)의 '키워드별 지정값으로 변경'과 같은 규칙을 쓴다.
+    확장자를 뺀 이름이 왼쪽 값과 (앞뒤 공백·대소문자 무시) 같으면 오른쪽 값으로 바꾼다.
+    위쪽 줄이 우선한다."""
+    pairs = []
+    for r in rules or []:
+        a = (r.get("a") or "").strip()
+        b = (r.get("b") or "").strip()
+        if a and b:
+            pairs.append((a.lower(), b))
+
+    out = []
+    for idx, folder in enumerate(folders or []):
+        info = {"folder": folder, "missing": False, "total": 0, "jobs": []}
+        if not os.path.isdir(folder):
+            info["missing"] = True
+            out.append(info)
+            continue
+        if pairs:
+            try:
+                with os.scandir(folder) as it:
+                    for entry in it:
+                        if entry.name.startswith("."):
+                            continue
+                        try:
+                            if not entry.is_file():
+                                continue
+                        except OSError:
+                            continue
+                        info["total"] += 1
+                        stem, ext = os.path.splitext(entry.name)
+                        key = stem.strip().lower()
+                        for a, b in pairs:
+                            if a == key:
+                                dst = b + ext
+                                if dst != entry.name:
+                                    info["jobs"].append({"src": entry.name, "dst": dst, "d": idx})
+                                break
+            except OSError as e:
+                info["missing"] = True
+                info["error"] = str(e)
+        out.append(info)
+    return out
+
+
 def pick_folder_native():
     """폴더 선택 다이얼로그 (HTTP 워커 스레드에서 호출된다).
 
@@ -1054,12 +1229,7 @@ def pick_folder_native():
     디스패처가 없을 때만 예전 방식(별도 프로세스)으로 되돌아간다.
     """
     if _DIALOG_READY.is_set():
-        resp = queue.Queue(1)
-        _DIALOG_REQ.put(resp)
-        try:
-            picked = resp.get(timeout=600)
-        except queue.Empty:
-            return None
+        picked = _ask_dialog("one", "")
         picked = (picked or "").strip().rstrip("/")
         return picked.replace("/", os.sep) if picked else None
 
@@ -1368,6 +1538,21 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .recent-item:hover{background:var(--cloud)}
 .recent-empty{padding:10px 12px;font-size:13px;color:var(--mute)}
+
+/* ===== 키워드별 지정값으로 변경: 여러 폴더에 한꺼번에 적용 ===== */
+.multibox{margin-top:22px;padding-top:18px;border-top:1px solid var(--hairline)}
+.multihead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+.multihead b{font-size:14px}
+#mapFolderList{margin-top:12px}
+.mfrow{display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:center;
+  padding:8px 0;border-bottom:1px solid var(--hairline-soft);font-size:13px}
+.mfpath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mfcount{white-space:nowrap;font-weight:500}
+.multiapply{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px}
+@media (max-width:960px){
+  .mfrow{grid-template-columns:1fr auto}
+  .mfrow .gobtn{grid-column:1/-1;justify-self:start;margin:4px 0 0}
+}
 @media (max-width:960px){
   /* 좁은 화면에선 nav 가 줄바꿈돼 버튼이 가운데로 온다. 버튼 오른쪽 끝에 맞추면
      메뉴가 화면 밖으로 넘치므로, 화면 좌우 여백에 맞춰 편다. */
@@ -1465,6 +1650,22 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
         (마지막 줄이면 새 줄이 생깁니다), <b>Ctrl+Enter</b>는 그 자리 아래에 줄을 하나 끼워 넣습니다.</p>
       <div id="mapFields"></div>
       <button class="btn btn-secondary btn-sm" onclick="addMapRow()">＋ 줄 추가</button>
+
+      <div class="multibox">
+        <div class="multihead">
+          <b>여러 폴더에 한꺼번에 적용</b>
+          <button class="btn btn-secondary btn-sm" onclick="pickManyFolders()">여러 폴더 선택</button>
+          <button class="gobtn" id="mapClear" onclick="clearMapFolders()" style="display:none">선택 해제</button>
+        </div>
+        <p class="hint">폴더 선택창에서 <b>드래그</b>하거나 <b>Ctrl</b>을 누른 채 클릭하면 여러 폴더를 한 번에 고를 수 있습니다.
+          고른 모든 폴더에서 위 규칙에 해당하는 파일 이름이 함께 바뀝니다.
+          (위쪽 미리보기 표는 지금 선택된 폴더 하나만 보여줍니다)</p>
+        <div id="mapFolderList"></div>
+        <div class="multiapply" id="mapApplyRow" style="display:none">
+          <button class="btn btn-primary btn-sm" id="mapApplyBtn" onclick="askApplyMap()">여러 폴더에 적용</button>
+          <span class="hint" id="mapApplyInfo"></span>
+        </div>
+      </div>
     </div>
     <div class="panel" id="panel-replace">
       <h3>찾기 / 바꾸기</h3>
@@ -1773,6 +1974,7 @@ const CATEGORIES = {
 let state = {folder:"", files:[], allNames:[], dirs:[], tab:"rename", org:"category",
              preview:[], canUndo:false, perText:{}, nApply:0, nConflict:0,
              pdfOp:"merge", pdfFiles:[], pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[],
+             mapFolders:[], mapScan:[],
              renameTarget:"files", loadedInclude:"", mkMode:"list", mkPlan:null};
 const $ = id => document.getElementById(id);
 
@@ -1907,7 +2109,7 @@ function renderMapFields(){
   });
   $("mapFields").innerHTML = h;
 }
-function onMapInput(i, key, val){ state.mapRules[i][key] = val; recompute(); }
+function onMapInput(i, key, val){ state.mapRules[i][key] = val; recompute(); scheduleMapScan(); }
 // i번째 줄의 'a'(왼쪽)/'b'(오른쪽) 칸으로 커서를 옮긴다
 function focusMapCell(i, key){
   const row = $("mapFields").querySelectorAll(".maprow")[i];
@@ -1939,6 +2141,87 @@ function addMapRow(at, key){
   renderMapFields(); recompute();
   focusMapCell(idx, key || "a");
 }
+// ----- 키워드별 지정값으로 변경: 여러 폴더에 한꺼번에 적용 -----
+async function pickManyFolders(){
+  const res = await api("/api/pick_many");
+  const paths = res.paths || [];
+  if(!paths.length) return;                 // 취소했거나 고른 게 없음
+  state.mapFolders = paths;
+  await scanMapFolders();
+}
+function clearMapFolders(){
+  state.mapFolders = []; state.mapScan = [];
+  renderMapFolders();
+}
+let mapScanTimer;
+function scheduleMapScan(){
+  if(!state.mapFolders.length) return;
+  clearTimeout(mapScanTimer);
+  mapScanTimer = setTimeout(()=>scanMapFolders(), 300);   // 타이핑이 멈추면 다시 계산
+}
+async function scanMapFolders(){
+  if(!state.mapFolders.length){ renderMapFolders(); return; }
+  const res = await api("/api/map_scan", {folders:state.mapFolders, rules:state.mapRules});
+  state.mapScan = res.folders || [];
+  renderMapFolders();
+}
+function mapJobs(){
+  return (state.mapScan || []).reduce((all, s)=>all.concat(s.jobs || []), []);
+}
+function openMapFolder(i){ openPath(state.mapFolders[i]); }
+function renderMapFolders(){
+  const box = $("mapFolderList"), row = $("mapApplyRow"), clear = $("mapClear");
+  if(!box) return;
+  if(!state.mapFolders.length){
+    box.innerHTML = ""; row.style.display = "none"; clear.style.display = "none"; return;
+  }
+  clear.style.display = "";
+  const scan = state.mapScan || [];
+  box.innerHTML = state.mapFolders.map((f,i)=>{
+    const s = scan[i] || {}, hit = (s.jobs || []).length;
+    const info = s.missing
+      ? '<span class="mfcount warn">폴더를 찾을 수 없음</span>'
+      : `<span class="mfcount ${hit ? "ok" : "hint"}">${hit}개 바뀜</span>`;
+    return `<div class="mfrow"><span class="mfpath" title="${escA(f)}">${esc(f)}</span>${info}`
+      + `<button class="gobtn" onclick="openMapFolder(${i})">탐색기에서 열기</button></div>`;
+  }).join("");
+  const jobs = mapJobs();
+  row.style.display = "";
+  $("mapApplyBtn").disabled = !jobs.length;
+  $("mapApplyInfo").innerHTML = jobs.length
+    ? `폴더 ${state.mapFolders.length}개에서 <b class="ok">${jobs.length}개</b> 파일 이름이 바뀝니다.`
+    : "규칙에 해당하는 파일이 없습니다. 위 표에 왼쪽·오른쪽 값을 입력하세요.";
+}
+function askApplyMap(){
+  const jobs = mapJobs();
+  if(!jobs.length) return;
+  const sample = jobs.slice(0,5)
+    .map(j=>`${esc(j.src)} <span class="hint">→</span> <b>${esc(j.dst)}</b>`).join("<br>");
+  showDialog("여러 폴더에 적용",
+    `폴더 <b>${state.mapFolders.length}개</b>에서 <b>${jobs.length}개</b> 파일의 이름을 바꿉니다.<br><br>`
+      + sample + (jobs.length > 5 ? `<br><span class="hint">… 외 ${jobs.length-5}개</span>` : "")
+      + `<br><br>실행한 뒤 <b>실행 취소</b>로 한 번에 되돌릴 수 있습니다.`,
+    `${jobs.length}개 이름 바꾸기`, applyMapFolders);
+}
+async function applyMapFolders(){
+  const jobs = mapJobs();
+  if(!jobs.length) return;
+  const nFolders = state.mapFolders.length;
+  const res = await api("/api/execute", {folders:state.mapFolders, jobs, mode:"rename"});
+  if(res.error){ setStatus(res.error, true); return; }
+  state.canUndo = res.canUndo; $("btnUndo").disabled = !res.canUndo;
+  await scanMapFolders();
+  if(state.folder) await reload();          // 지금 보고 있는 폴더 목록도 갱신
+  let msg = `<b class="ok">폴더 ${nFolders}개에서 ${res.done}개 이름 변경 완료</b> · 실행 취소 가능`;
+  if(res.errors.length) msg += ` · <span class="warn">실패 ${res.errors.length}건: ${esc(res.errors[0])}</span>`;
+  msg += ` <button class="gobtn" onclick="openMapFolder(0)">탐색기에서 열기</button>`;
+  setStatus(msg, false, true);
+  addHistory("여러 폴더 이름 변경",
+             `폴더 ${nFolders}개 · ${res.done}개 성공`
+             + (res.errors.length ? ` · 실패 ${res.errors.length}건` : ""),
+             state.mapFolders[0]);
+}
+
 function removeMapRow(i){
   state.mapRules.splice(i,1);
   if(!state.mapRules.length) state.mapRules.push({a:"", b:""});
@@ -2738,6 +3021,7 @@ function draftSnapshot(){
   return {t:Date.now(),
           rules:[...document.querySelectorAll(".chip[data-rule]")].filter(c=>c.classList.contains("active")).map(c=>c.dataset.rule),
           fields:collectFields(), keywords:state.keywords, mapRules:state.mapRules,
+          mapFolders:state.mapFolders,
           perText:state.perText, org:state.org, mkMode:state.mkMode, target:state.renameTarget};
 }
 function draftHasContent(d){
@@ -2770,9 +3054,11 @@ function applyDraft(d){
   });
   state.keywords = d.keywords || [];
   state.mapRules = d.mapRules || [];
+  state.mapFolders = d.mapFolders || [];
   state.perText  = d.perText  || {};
   if(state.keywords.length) renderKwFields();
   if(state.mapRules.length) renderMapFields();
+  if(state.mapFolders.length) scanMapFolders();      // 폴더가 지워졌는지도 여기서 확인된다
   if(d.target){ state.renameTarget = d.target; if($("renameTarget")) $("renameTarget").value = d.target; }
   if(d.org){ const c = document.querySelector('#orgChips .chip[data-org="'+d.org+'"]'); if(c) pickOrg(c); }
   if(d.mkMode){ const c = document.querySelector('#mkChips .chip[data-mk="'+d.mkMode+'"]'); if(c) pickMk(c); }
@@ -2784,9 +3070,9 @@ function clearDraft(){
     "초기화", ()=>{ try{ localStorage.removeItem(DRAFT_KEY); }catch(e){} location.reload(); });
 }
 
-function addHistory(kind, summary){
+function addHistory(kind, summary, folder){
   const h = lsGet(HIST_KEY) || [];
-  h.unshift({t:Date.now(), kind, summary, folder:state.folder});
+  h.unshift({t:Date.now(), kind, summary, folder:folder || state.folder});
   lsSet(HIST_KEY, h.slice(0,30));
   renderHistory();
 }
@@ -3180,6 +3466,13 @@ class Handler(BaseHTTPRequestHandler):
                     path = pick_folder_native()
                     return self._json({"path": path})
 
+                if self.path == "/api/pick_many":
+                    return self._json({"paths": pick_folders_native()})
+
+                if self.path == "/api/map_scan":
+                    return self._json({"folders": map_scan(body.get("folders", []),
+                                                           body.get("rules", []))})
+
                 if self.path == "/api/list":
                     folder = body.get("folder", "")
                     if not os.path.isdir(folder):
@@ -3192,10 +3485,26 @@ class Handler(BaseHTTPRequestHandler):
 
                 if self.path == "/api/execute":
                     folder = body.get("folder", "")
-                    if not os.path.isdir(folder):
+                    folders = body.get("folders") or None      # 여러 폴더에 한꺼번에 적용할 때
+                    if folders:
+                        # 실제로 작업이 있는 폴더만 확인한다. 목록에 지워진 폴더가
+                        # 섞여 있어도 나머지 폴더 작업까지 막지 않기 위함이다.
+                        bad = None
+                        for j in body.get("jobs", []):
+                            try:
+                                base = folders[int(j.get("d", 0))]
+                            except (TypeError, ValueError, IndexError, AttributeError):
+                                bad = "폴더 지정이 잘못되었습니다."
+                                break
+                            if not os.path.isdir(base):
+                                bad = "폴더를 찾을 수 없습니다: " + base
+                                break
+                        if bad:
+                            return self._json({"error": bad})
+                    elif not os.path.isdir(folder):
                         return self._json({"error": "폴더를 찾을 수 없습니다"})
                     done, errors = execute_jobs(folder, body.get("jobs", []),
-                                                body.get("mode", "rename"))
+                                                body.get("mode", "rename"), folders)
                     return self._json({"done": done, "errors": errors,
                                        "canUndo": bool(UNDO_STACK)})
 
