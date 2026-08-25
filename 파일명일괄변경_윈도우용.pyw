@@ -1648,7 +1648,8 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
       <h3>키워드별 지정값으로 변경 — 기존 이름이 왼쪽 값과 <b>정확히 같으면</b> 오른쪽 값으로 바꿉니다</h3>
       <p class="hint" style="margin-bottom:12px">확장자는 그대로 유지됩니다. 예) 왼쪽 <b>1</b> → 오른쪽 <b>1_이력서</b> 로 두면 <b>1.pdf</b> 가 <b>1_이력서.pdf</b> 로 바뀝니다.
         빈 칸·매칭 안 되는 파일은 그대로 둡니다. 입력칸에서 <b>Enter</b>를 누르면 같은 칸의 <b>아랫줄</b>로 내려가고
-        (마지막 줄이면 새 줄이 생깁니다), <b>Ctrl+Enter</b>는 그 자리 아래에 줄을 하나 끼워 넣습니다.</p>
+        (마지막 줄이면 새 줄이 생깁니다), <b>Ctrl+Enter</b>는 그 자리 아래에 줄을 하나 끼워 넣습니다.<br>
+        <b>방향키</b>로 칸 사이를 옮겨 다닐 수 있고, 그렇게 옮긴 칸에서 <b>F2</b>를 누르면 그 칸을 고쳐 쓸 수 있습니다.</p>
       <div id="mapFields"></div>
       <button class="btn btn-secondary btn-sm" onclick="addMapRow()">＋ 줄 추가</button>
 
@@ -1697,7 +1698,7 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
         <select class="field" id="perTextPos" onchange="recompute()">
           <option value="front">이름 앞에</option><option value="back">이름 뒤에</option>
         </select>
-        <span class="hint">아래 미리보기의 <b>‘붙일 텍스트’</b> 칸에 파일마다 입력하세요. 칸 오른쪽 아래 ■ 손잡이를 아래로 드래그하면 같은 값이 연속으로 채워집니다. 복사·붙여넣기(여러 줄 붙여넣기 포함)도 됩니다.</span>
+        <span class="hint">아래 미리보기의 <b>‘붙일 텍스트’</b> 칸에 파일마다 입력하세요. 칸 오른쪽 아래 ■ 손잡이를 아래로 드래그하면 같은 값이 연속으로 채워집니다. 복사·붙여넣기(여러 줄 붙여넣기 포함)도 됩니다. <b>방향키</b>로 칸 사이를 옮기고 <b>F2</b>로 고쳐 쓸 수 있습니다.</span>
       </div>
     </div>
     <div class="panel" id="panel-date">
@@ -1752,7 +1753,8 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
 
     <div id="kwBox" style="display:none;margin-top:18px">
       <p class="hint" style="margin-bottom:10px">입력한 <b>키워드가 파일명에 포함된 파일</b>끼리 그 키워드 이름의 폴더로 모읍니다.
-        (여러 키워드에 해당하면 위쪽 키워드가 우선)</p>
+        (여러 키워드에 해당하면 위쪽 키워드가 우선)
+        <b>방향키</b>로 칸 사이를 옮기고 <b>F2</b>로 고쳐 쓸 수 있습니다.</p>
       <div id="kwFields"></div>
       <button class="btn btn-secondary btn-sm" id="kwAdd"
               onmousedown="startKwDrag(event)" title="클릭하면 1개 추가 · 누른 채로 아래로 드래그하면 여러 개 추가">＋ 키워드 추가</button>
@@ -3117,6 +3119,84 @@ function renderHistory(){
       + `</div>`;
   }).join("");
 }
+
+// ============ 표 형태 입력칸: 방향키 이동 + F2 편집 ============
+// 같은 성격의 줄이 여러 개인 입력칸에서 엑셀처럼 칸 사이를 옮겨 다닌다.
+//  · 방향키로 옮겨온 칸은 값이 통째로 선택된 '고른 상태'.
+//    이때는 좌우 방향키가 옆 칸으로 이동, 글자를 치면 값이 바뀐다.
+//  · F2 를 누르면 커서가 값 끝으로 가는 '편집 상태'.
+//    이때는 좌우 방향키가 글자 사이를 움직인다.
+//  · 클릭하거나 Enter 로 넘어온 칸은 예전처럼 곧바로 편집 상태다.
+const GRID_DEFS = [
+  {box:"mapFields", row:".maprow", cell:"input"},        // 키워드별 지정값으로 변경
+  {box:"kwFields",  row:".kwrow",  cell:"input"},        // 키워드별 정리
+  {box:"rows",      row:".frow",   cell:"input.tcell"},  // 미리보기 표의 '붙일 텍스트'
+];
+let gridNavCell = null;        // 방향키로 옮겨와 '고른 상태'인 칸
+
+function gridFind(el){
+  for(const d of GRID_DEFS){
+    const box = $(d.box);
+    if(!box || !box.contains(el)) continue;
+    const grid = [...box.querySelectorAll(d.row)].map(r=>[...r.querySelectorAll(d.cell)]);
+    for(let r=0;r<grid.length;r++){
+      const c = grid[r].indexOf(el);
+      if(c >= 0) return {grid, r, c};
+    }
+  }
+  return null;
+}
+function gridGo(grid, r, c, edit){
+  const row = grid[r];
+  if(!row || !row.length) return false;
+  const el = row[Math.min(c, row.length - 1)];
+  if(!el || el.offsetParent === null) return false;      // 숨어 있는 칸으로는 가지 않는다
+  el.focus();
+  if(edit){
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+    gridNavCell = null;
+  }else{
+    el.select();                                          // 값 전체 선택 = 고른 상태 표시
+    gridNavCell = el;
+  }
+  return true;
+}
+function onGridKey(e){
+  const el = e.target;
+  if(!el || el.tagName !== "INPUT" || el.type === "checkbox") return;
+  const g = gridFind(el);
+  if(!g) return;
+  const navMode = (el === gridNavCell);
+
+  if(e.key === "F2"){                       // 칸 안으로 들어가 수정
+    e.preventDefault();
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+    gridNavCell = null;
+    return;
+  }
+  if(e.key === "ArrowDown" || e.key === "ArrowUp"){
+    e.preventDefault();
+    gridGo(g.grid, g.r + (e.key === "ArrowDown" ? 1 : -1), g.c, false);
+    return;
+  }
+  if(navMode && (e.key === "ArrowRight" || e.key === "ArrowLeft")){
+    e.preventDefault();
+    let r = g.r, c = g.c + (e.key === "ArrowRight" ? 1 : -1);
+    if(c < 0){ r--; c = (g.grid[r] || []).length - 1; }          // 줄 처음에서 왼쪽 → 윗줄 끝칸
+    else if(c >= g.grid[g.r].length){ r++; c = 0; }              // 줄 끝에서 오른쪽 → 아랫줄 첫칸
+    if(r < 0 || r >= g.grid.length) return;
+    gridGo(g.grid, r, c, false);
+    return;
+  }
+  // 고른 상태에서 글자를 치거나 지우면 그대로 편집 상태로 넘어간다
+  if(navMode && ((e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey)
+                 || e.key === "Backspace" || e.key === "Delete"))
+    gridNavCell = null;
+}
+document.addEventListener("keydown", onGridKey);
+document.addEventListener("mousedown", ()=>{ gridNavCell = null; }, true);   // 클릭한 칸은 편집 상태
 
 // ================= 단축키 =================
 document.addEventListener("keydown", e=>{
