@@ -41,9 +41,9 @@ echo  [1/2] 필요한 부품을 설치합니다...
 echo.
 if exist "wheels" (
     echo  ※ wheels 폴더가 있어 인터넷 없이 설치합니다.
-    python -m pip install --no-index --find-links=wheels pyinstaller pypdf Pillow pywin32 openpyxl pymupdf pillow-heif
+    python -m pip install --no-index --find-links=wheels pyinstaller pypdf Pillow pywin32 openpyxl pymupdf pi-heif
 ) else (
-    python -m pip install --upgrade pyinstaller pypdf Pillow pywin32 openpyxl pymupdf pillow-heif
+    python -m pip install --upgrade pyinstaller pypdf Pillow pywin32 openpyxl pymupdf pi-heif
 )
 if errorlevel 1 (
     echo.
@@ -72,7 +72,7 @@ echo.
 REM ---------- 4. 실제로 불러올 수 있는지 최종 점검 ----------
 REM  설치는 됐는데 못 불러오는 경우가 있어, 반쪽짜리 EXE 를 막기 위해 확인한다
 echo  [점검] 부품이 정상 동작하는지 확인합니다...
-python -c "import pypdf, PIL, fitz, pillow_heif, openpyxl" 2>nul
+python -c "import pypdf, PIL, fitz, pi_heif, openpyxl" 2>nul
 if errorlevel 1 (
     echo.
     echo [중단] 부품은 설치됐지만 불러오지 못했습니다.

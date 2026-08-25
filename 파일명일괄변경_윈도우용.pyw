@@ -646,9 +646,15 @@ def images_convert(folder, files, fmt, dpi=150):
                            "heic", "heif", "pdf"])
     if not items:
         raise RuntimeError("이미지 또는 PDF 파일을 선택하세요.")
-    # HEIC/HEIF가 포함돼 있으면 pillow-heif로 열기 지원 등록
+    # HEIC/HEIF가 포함돼 있으면 열기 지원 등록.
+    # pi-heif 와 pillow-heif 는 같은 프로젝트이고 읽은 결과도 같다. 다만 pi-heif 는
+    # '저장'용 인코더(libx265, 21MB)가 빠진 가벼운 빌드라, HEIC 를 읽기만 하는
+    # 이 앱에는 그쪽이 알맞다. 없으면 예전처럼 pillow-heif 를 쓴다.
     if any(os.path.splitext(p)[1].lower() in (".heic", ".heif") for _, p in items):
-        heif = ensure_pkg("pillow_heif", "pillow-heif")
+        try:
+            import pi_heif as heif
+        except ImportError:
+            heif = ensure_pkg("pillow_heif", "pillow-heif")
         heif.register_heif_opener()
     results = []
     ok = 0
