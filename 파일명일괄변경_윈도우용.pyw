@@ -2022,11 +2022,18 @@ function neededInclude(){
   return state.tab==="rename" ? (state.renameTarget || "files") : "files";
 }
 
+// 목록 요청은 답이 오는 데 시간이 걸린다. 그 사이에 폴더나 조건을 바꾸면
+// 먼저 보낸 요청의 답이 나중에 도착해, 방금 고른 조건의 목록을 덮어쓸 수 있다.
+// 요청마다 번호를 붙여, 가장 마지막 요청의 답만 화면에 반영한다.
+let listToken = 0;
+
 async function reload(silent){
   if(!state.folder) return;
   const exts = $("extFilter").value.split(",").map(s=>s.trim().toLowerCase().replace(/^\./,"")).filter(Boolean);
   const include = neededInclude();
+  const token = ++listToken;
   const res = await api("/api/list",{folder:state.folder, exts, include});
+  if(token !== listToken) return;            // 더 새 요청이 있으면 이 답은 버린다
   if(res.error){
     if(silent){   // 시작할 때 되살린 폴더가 없어졌을 뿐이니 부드럽게 안내
       state.folder = ""; $("btnOpen").disabled = true;
@@ -3353,14 +3360,21 @@ function renderPdfOptions(){
   $("pdfOptions").innerHTML = h;
 }
 
+let pdfListToken = 0;
+
 async function loadPdfFiles(){
+  const token = ++pdfListToken;
+  const op = state.pdfOp;                    // 답이 올 때까지 기능이 바뀌었는지 견주기 위해
   state.pdfSelected = new Set();
   state.pdfRanges = {};
   if(!state.folder){
     $("pdfList").innerHTML = '<div class="empty">상단의 <b>폴더 선택</b>으로 폴더를 지정하세요.</div>';
     $("pdfListInfo").textContent = ""; updatePdfRun(); return;
   }
-  const res = await api("/api/list", {folder:state.folder, exts:PDF_EXTS[state.pdfOp]});
+  const res = await api("/api/list", {folder:state.folder, exts:PDF_EXTS[op]});
+  // 기능을 빠르게 바꾸면 먼저 보낸 요청의 답이 나중에 도착해, 이전 기능의
+  // 확장자 목록이 그대로 남는 일이 있었다. 낡은 답은 여기서 버린다.
+  if(token !== pdfListToken || op !== state.pdfOp) return;
   if(res.error){ $("pdfList").innerHTML = '<div class="empty">'+esc(res.error)+'</div>'; return; }
   state.pdfFiles = res.files;
   state.pdfFilesOrig = [...res.files];    // 파일명 오름차순 원본 (서버가 준 자연순)
