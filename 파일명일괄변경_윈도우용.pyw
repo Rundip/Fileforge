@@ -1436,6 +1436,8 @@ body.textcol .col-text{display:block}
 .pdfrow.sel .pname{color:var(--ink)}
 .pdfrange{flex:none;width:190px;padding:8px 14px;font-size:13px}
 .pdfrow .grip{font-size:14px}
+.pdfrow.movable{cursor:grab}
+.pdfrow.movable:active{cursor:grabbing}
 .pdfseq{flex:none;width:88px;margin-left:auto;padding:8px 8px;font-size:13px;text-align:center}
 /* 숫자 조절 화살표가 폭을 차지해 '순서' 글씨가 잘렸다 — 직접 입력만 쓰므로 숨긴다 */
 .pdfseq::-webkit-outer-spin-button,
@@ -3305,7 +3307,8 @@ function renderPdfOptions(){
       <option value="desc">파일명 내림차순</option>
       <option value="manual">직접 지정 (드래그 · 번호)</option></select>
     <span class="hint">목록에 보이는 <b>위에서 아래 차례</b>로 합쳐집니다.
-      ⠿ 을 끌어 옮기거나, 오른쪽 <b>순서</b> 칸에 번호를 넣고 Enter 를 누르면 그 번호가 <b>작은 것부터</b> 놓입니다.</span></div>`;
+      줄을 <b>위아래로 끌어</b> 옮기거나, 오른쪽 <b>순서</b> 칸에 번호를 넣고 Enter 를 누르면 그 번호가 <b>작은 것부터</b> 놓입니다.
+      (짧게 누르면 선택/해제)</span></div>`;
   const nameIn = (ph)=>`<div class="row"><span class="hint">저장 이름</span>
     <input class="field" id="pdfOut" placeholder="${ph} (비우면 자동)"></div>`;
   let h = "";
@@ -3392,7 +3395,8 @@ function renderPdfList(){
         placeholder="예: 1-5, 7-8 (전체)"
         onclick="event.stopPropagation()" oninput="setPdfRange(${i}, this.value)">`;
     }
-    h += `<div class="pdfrow ${on?'sel':''}" data-index="${i}" onclick="togglePdfRow(${i})">
+    const dragAttr = ordered ? ` onmousedown="startPdfRowDrag(event,${i})"` : "";
+    h += `<div class="pdfrow ${on?'sel':''} ${ordered?'movable':''}" data-index="${i}" onclick="togglePdfRow(${i})"${dragAttr}>
       ${gripUi}<span class="pdfdot"></span><span class="pname">${esc(f.name)}</span>${seqUi}${rangeUi}</div>`;
   });
   $("pdfList").innerHTML = h;
@@ -3440,6 +3444,41 @@ function applyPdfSeq(){
   setPdfOrderMode("manual");
   renderPdfList();
 }
+// 줄 아무 데나 눌러서 위아래로 끌면 차례가 바뀐다.
+// 줄을 누르는 것은 원래 '선택 전환'이므로, 조금 움직인 것은 누른 것으로,
+// 일정 거리 이상 끈 것은 옮기는 것으로 나눈다.
+let pdfDrag = null, pdfDragged = false;
+const PDF_DRAG_SLOP = 5;          // 이만큼 넘게 움직여야 옮기는 것으로 본다
+
+function startPdfRowDrag(e, i){
+  if(e.button !== 0 || !pdfOrderable()) return;
+  // 입력칸·버튼·손잡이에서 시작한 것은 각자의 동작에 맡긴다
+  if(e.target.closest && e.target.closest('input, button, select, textarea, .grip')) return;
+  pdfDrag = {i, x:e.clientX, y:e.clientY, moved:false};
+  document.addEventListener("mousemove", onPdfRowDragMove);
+  document.addEventListener("mouseup", onPdfRowDragUp);
+}
+function onPdfRowDragMove(e){
+  if(!pdfDrag) return;
+  if(!pdfDrag.moved){
+    if(Math.abs(e.clientX - pdfDrag.x) + Math.abs(e.clientY - pdfDrag.y) < PDF_DRAG_SLOP) return;
+    pdfDrag.moved = true;
+    pdfReorder = {from: pdfDrag.i};
+    document.body.style.userSelect = "none";
+    try{ window.getSelection().removeAllRanges(); }catch(err){}
+  }
+  onPdfReorderMove(e);            // 옮기는 처리는 손잡이 드래그와 같은 코드를 쓴다
+}
+function onPdfRowDragUp(){
+  document.removeEventListener("mousemove", onPdfRowDragMove);
+  document.removeEventListener("mouseup", onPdfRowDragUp);
+  if(pdfDrag && pdfDrag.moved){
+    pdfDragged = true;            // 뒤이어 오는 click 이 선택을 뒤집지 않도록
+    onPdfReorderUp();
+  }
+  pdfDrag = null;
+}
+
 let pdfReorder = null;
 function startPdfReorder(e, i){
   if(e.button !== 0) return;
@@ -3473,6 +3512,7 @@ function onPdfReorderUp(){
 }
 
 function togglePdfRow(i){
+  if(pdfDragged){ pdfDragged = false; return; }   // 방금 끌어 옮긴 것이면 선택은 그대로 둔다
   const name = state.pdfFiles[i].name;
   if(state.pdfOp==="split"){
     state.pdfSelected = state.pdfSelected.has(name) ? new Set() : new Set([name]);
