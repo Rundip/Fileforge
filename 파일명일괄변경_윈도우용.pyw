@@ -349,7 +349,10 @@ def _unique_path(folder, name):
 
 
 def _select_paths(folder, files, exts, order="asc"):
-    """선택된 파일명들을 검증·정렬해 [(이름, 절대경로)] 반환. files 비면 폴더 내 해당 확장자 전체."""
+    """선택된 파일명들을 검증·정렬해 [(이름, 절대경로)] 반환. files 비면 폴더 내 해당 확장자 전체.
+
+    order="keep" 이면 정렬하지 않고 받은 순서를 그대로 쓴다.
+    (화면에서 드래그·번호로 직접 정한 순서를 그대로 반영하기 위함)"""
     if files:
         items = []
         for n in files:
@@ -362,7 +365,8 @@ def _select_paths(folder, files, exts, order="asc"):
     else:
         listed, _ = list_files(folder, set(exts))
         items = [(f["name"], os.path.join(folder, f["name"])) for f in listed]
-    items.sort(key=lambda it: _natkey(it[0]), reverse=(order == "desc"))
+    if order != "keep":
+        items.sort(key=lambda it: _natkey(it[0]), reverse=(order == "desc"))
     return items
 
 
@@ -1430,7 +1434,16 @@ body.textcol .col-text{display:block}
   box-shadow:inset 0 0 0 3px var(--canvas)}
 .pdfrow .pname{font-weight:500}
 .pdfrow.sel .pname{color:var(--ink)}
-.pdfrange{flex:none;width:200px;margin-left:auto;padding:8px 14px;font-size:13px}
+.pdfrange{flex:none;width:190px;padding:8px 14px;font-size:13px}
+.pdfrow .grip{font-size:14px}
+.pdfseq{flex:none;width:88px;margin-left:auto;padding:8px 8px;font-size:13px;text-align:center}
+/* 숫자 조절 화살표가 폭을 차지해 '순서' 글씨가 잘렸다 — 직접 입력만 쓰므로 숨긴다 */
+.pdfseq::-webkit-outer-spin-button,
+.pdfseq::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.pdfseq{-moz-appearance:textfield;appearance:textfield}
+.pdfrow .pname{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pdfrow.dragging{opacity:.45}
+.pdfseqhead{font-size:11px;color:var(--mute);font-weight:500}
 .pdf-actions{margin-top:24px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 #pdfResult{font-size:14px;font-weight:500}
 #pdfResult.ok{color:var(--success)}
@@ -1983,7 +1996,7 @@ const CATEGORIES = {
 
 let state = {folder:"", files:[], allNames:[], dirs:[], tab:"rename", org:"category",
              preview:[], canUndo:false, perText:{}, nApply:0, nConflict:0,
-             pdfOp:"merge", pdfFiles:[], pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[],
+             pdfOp:"merge", pdfFiles:[], pdfFilesOrig:[], pdfSeq:{}, pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[],
              mapFolders:[], mapScan:[],
              renameTarget:"files", loadedInclude:"", mkMode:"list", mkPlan:null};
 const $ = id => document.getElementById(id);
@@ -3285,9 +3298,14 @@ function pickPdfOp(chip){
 
 function renderPdfOptions(){
   const op = state.pdfOp;
-  const orderSel = `<div class="row"><span class="hint">정렬</span>
-    <select class="field" id="pdfOrder"><option value="asc">파일명 오름차순</option>
-    <option value="desc">파일명 내림차순</option></select></div>`;
+  // 합치기 계열은 목록에 보이는 차례가 곧 합쳐지는 차례다(드래그·번호로 직접 바꿀 수 있음)
+  const orderSel = `<div class="row"><span class="hint">순서</span>
+    <select class="field" id="pdfOrder" onchange="onPdfOrderChange()">
+      <option value="asc">파일명 오름차순</option>
+      <option value="desc">파일명 내림차순</option>
+      <option value="manual">직접 지정 (드래그 · 번호)</option></select>
+    <span class="hint">목록에 보이는 <b>위에서 아래 차례</b>로 합쳐집니다.
+      ⠿ 을 끌어 옮기거나, 오른쪽 <b>순서</b> 칸에 번호를 넣고 Enter 를 누르면 그 번호가 <b>작은 것부터</b> 놓입니다.</span></div>`;
   const nameIn = (ph)=>`<div class="row"><span class="hint">저장 이름</span>
     <input class="field" id="pdfOut" placeholder="${ph} (비우면 자동)"></div>`;
   let h = "";
@@ -3342,6 +3360,8 @@ async function loadPdfFiles(){
   const res = await api("/api/list", {folder:state.folder, exts:PDF_EXTS[state.pdfOp]});
   if(res.error){ $("pdfList").innerHTML = '<div class="empty">'+esc(res.error)+'</div>'; return; }
   state.pdfFiles = res.files;
+  state.pdfFilesOrig = [...res.files];    // 파일명 오름차순 원본 (서버가 준 자연순)
+  state.pdfSeq = {};
   renderPdfList();
 }
 
@@ -3352,22 +3372,104 @@ function renderPdfList(){
     $("pdfList").innerHTML = '<div class="empty">'+PDF_EMPTY[state.pdfOp]+'</div>';
     $("pdfListInfo").textContent = ""; updatePdfRun(); return;
   }
+  const ordered = pdfOrderable();     // 합치기·이미지→PDF 는 차례가 결과에 영향을 준다
   let h = "";
   state.pdfFiles.forEach((f,i)=>{
     const on = state.pdfSelected.has(f.name);
-    let rangeUi = "";
+    let gripUi = "", seqUi = "", rangeUi = "";
+    if(ordered){
+      gripUi = `<span class="grip" title="끌어서 합쳐지는 차례 바꾸기"
+        onmousedown="startPdfReorder(event,${i})">⠿</span>`;
+      const sv = state.pdfSeq[f.name] || "";
+      seqUi = `<input class="field pdfseq" type="number" min="1" value="${esc(sv)}"
+        placeholder="순서" title="번호를 넣고 Enter — 작은 번호부터 놓입니다"
+        onclick="event.stopPropagation()" oninput="setPdfSeq(${i}, this.value)"
+        onchange="applyPdfSeq()" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}">`;
+    }
     if(state.pdfOp==="merge" && on){
       const v = state.pdfRanges[f.name] || "";
       rangeUi = `<input class="field pdfrange" type="text" value="${esc(v)}"
         placeholder="예: 1-5, 7-8 (전체)"
         onclick="event.stopPropagation()" oninput="setPdfRange(${i}, this.value)">`;
     }
-    h += `<div class="pdfrow ${on?'sel':''}" onclick="togglePdfRow(${i})">
-      <span class="pdfdot"></span><span class="pname">${esc(f.name)}</span>${rangeUi}</div>`;
+    h += `<div class="pdfrow ${on?'sel':''}" data-index="${i}" onclick="togglePdfRow(${i})">
+      ${gripUi}<span class="pdfdot"></span><span class="pname">${esc(f.name)}</span>${seqUi}${rangeUi}</div>`;
   });
   $("pdfList").innerHTML = h;
   $("pdfListInfo").textContent = `${state.pdfFiles.length}개 중 ${state.pdfSelected.size}개 선택`;
   updatePdfRun();
+}
+
+// ----- 합치기 차례 정하기 (드래그 · 번호) -----
+// 목록에 보이는 차례가 곧 합쳐지는 차례가 되도록, 화면 쪽에서 순서를 확정해
+// 그대로 서버에 넘긴다(order:"keep"). 예전에는 서버가 다시 정렬해서, 내림차순을
+// 골라도 화면은 오름차순으로 보이는 어긋남이 있었다.
+function pdfOrderable(){
+  return state.pdfOp === "merge" || state.pdfOp === "img2pdf";
+}
+function pdfOrderMode(){
+  const el = $("pdfOrder");
+  return (pdfOrderable() && el) ? el.value : "asc";
+}
+function setPdfOrderMode(v){
+  const el = $("pdfOrder");
+  if(el && el.value !== v) el.value = v;
+}
+// 파일명 정렬은 서버가 준 자연순(오름차순)을 그대로 쓰거나 뒤집는다.
+// 숫자가 섞인 이름도 서버와 똑같은 기준으로 늘어놓기 위함이다.
+function onPdfOrderChange(){
+  const m = pdfOrderMode();
+  if(m === "asc")  state.pdfFiles = [...state.pdfFilesOrig];
+  if(m === "desc") state.pdfFiles = [...state.pdfFilesOrig].reverse();
+  renderPdfList();
+}
+function setPdfSeq(i, val){
+  state.pdfSeq[state.pdfFiles[i].name] = val;
+}
+function applyPdfSeq(){
+  const numbered = [], plain = [];
+  state.pdfFiles.forEach(f=>{
+    const raw = (state.pdfSeq[f.name] || "").trim();
+    const v = raw === "" ? NaN : Number(raw);
+    if(isNaN(v)) plain.push(f); else numbered.push({f, v});
+  });
+  if(!numbered.length){ renderPdfList(); return; }
+  // 글자가 아니라 숫자 크기로 견준다 (그래서 9 다음이 10 이 된다)
+  numbered.sort((a,b)=>a.v - b.v);
+  state.pdfFiles = numbered.map(x=>x.f).concat(plain);   // 번호 없는 파일은 뒤로
+  setPdfOrderMode("manual");
+  renderPdfList();
+}
+let pdfReorder = null;
+function startPdfReorder(e, i){
+  if(e.button !== 0) return;
+  e.preventDefault(); e.stopPropagation();
+  pdfReorder = {from:i};
+  document.body.style.userSelect = "none";
+  document.addEventListener("mousemove", onPdfReorderMove);
+  document.addEventListener("mouseup", onPdfReorderUp);
+}
+function onPdfReorderMove(e){
+  if(!pdfReorder) return;
+  const t = document.elementFromPoint(e.clientX, e.clientY);
+  const row = t && t.closest && t.closest('.pdfrow');
+  if(!row) return;
+  const to = parseInt(row.dataset.index);
+  if(isNaN(to) || to === pdfReorder.from) return;
+  const [m] = state.pdfFiles.splice(pdfReorder.from, 1);
+  state.pdfFiles.splice(to, 0, m);
+  pdfReorder.from = to;
+  setPdfOrderMode("manual");
+  renderPdfList();
+  const moved = document.querySelector(`#pdfList .pdfrow[data-index="${to}"]`);
+  if(moved) moved.classList.add("dragging");
+}
+function onPdfReorderUp(){
+  document.removeEventListener("mousemove", onPdfReorderMove);
+  document.removeEventListener("mouseup", onPdfReorderUp);
+  document.body.style.userSelect = "";
+  pdfReorder = null;
+  renderPdfList();
 }
 
 function togglePdfRow(i){
@@ -3408,21 +3510,26 @@ function setPdfResult(msg, kind){
 }
 
 async function runPdfOp(){
-  const op = state.pdfOp, files = [...state.pdfSelected];
+  const op = state.pdfOp;
+  // 합치기 계열은 목록에 보이는 차례대로 넘긴다.
+  // (그 외 기능은 예전처럼 고른 차례 그대로 — 특히 '행 이어붙이기'는 먼저 고른 파일이 1번이다)
+  const files = pdfOrderable()
+    ? state.pdfFiles.filter(f=>state.pdfSelected.has(f.name)).map(f=>f.name)
+    : [...state.pdfSelected];
   $("pdfRun").disabled = true;
   setPdfResult("처리 중… (PDF 기능 첫 사용 시 라이브러리 설치로 시간이 걸릴 수 있습니다)");
   let res;
   if(op==="merge"){
     const ranges = {};
     files.forEach(n=>{ const r=(state.pdfRanges[n]||"").trim(); if(r) ranges[n]=r; });
-    res = await api("/api/merge", {folder:state.folder, files, order:gv("pdfOrder","asc"), out:gv("pdfOut",""), ranges});
+    res = await api("/api/merge", {folder:state.folder, files, order:"keep", out:gv("pdfOut",""), ranges});
   }
   else if(op==="split"){
     const del = (gv("pdfDelPages","")||"").trim();
     if(del) res = await api("/api/pdfdelete", {folder:state.folder, file:files[0], pages:del});
     else    res = await api("/api/split",     {folder:state.folder, file:files[0], pagesPer:gv("pdfPagesPer","10")});
   }
-  else if(op==="img2pdf") res = await api("/api/img2pdf", {folder:state.folder, files, order:gv("pdfOrder","asc"), out:gv("pdfOut","")});
+  else if(op==="img2pdf") res = await api("/api/img2pdf", {folder:state.folder, files, order:"keep", out:gv("pdfOut","")});
   else if(op==="pdf2img") res = await api("/api/pdf2img", {folder:state.folder, files, fmt:gv("pdfImgFmt","jpg"), dpi:gv("pdfImgDpi","150")});
   else if(op==="img2img") res = await api("/api/img2img", {folder:state.folder, files, fmt:gv("imgFmt","jpg"), dpi:gv("imgDpi","150")});
   else if(op==="compress")res = await api("/api/compress",{folder:state.folder, files, level:gv("pdfLevel","medium")});
