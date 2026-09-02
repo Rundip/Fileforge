@@ -8,8 +8,10 @@ FileForge — 파일 자동화 도구 (Windows 에디션, Nike 디자인 시스�
 실행 방법: Python 설치 후 이 파일을 더블클릭
 """
 
+import contextlib
 import http.client
 import importlib
+import io
 import json
 import os
 import queue
@@ -426,6 +428,97 @@ def _parse_page_ranges(spec, total, fname):
     return pages or None
 
 
+def _pdf_page_count(reader):
+    """pypdf reader의 페이지 수. 읽지 못하면 0을 돌려준다."""
+    try:
+        return len(reader.pages)
+    except Exception:
+        return 0
+
+
+def _repair_pdf_bytes(path, fname):
+    """구조가 깨진 PDF를 PyMuPDF로 페이지 단위로 새 문서에 옮겨 담아 복구한다.
+    (원본 파일은 절대 건드리지 않는다.) 복구 결과를 '메모리 위의 바이트'로 반환.
+
+    임시 파일을 쓰지 않는 이유: 윈도우에서는 pypdf가 연 파일을 삭제할 수 없어
+    임시 파일이 %TEMP% 폴더에 계속 쌓인다. 메모리로 처리하면 그런 찌꺼기가 없다."""
+    fitz = ensure_pkg("fitz", "pymupdf")
+    src = fitz.open(path)
+    try:
+        if getattr(src, "needs_pass", False):
+            raise RuntimeError(f"{fname}: 열기 암호가 걸린 PDF입니다. 암호를 풀어 저장한 뒤 다시 시도해 주세요.")
+        out = fitz.open()
+        try:
+            out.insert_pdf(src)
+            if out.page_count == 0:
+                raise RuntimeError("페이지 없음")
+            data = out.tobytes(deflate=True)
+        finally:
+            out.close()
+    finally:
+        src.close()
+    return data
+
+
+@contextlib.contextmanager
+def open_pdf(path, fname=None):
+    """PDF 한 개를 pypdf로 안전하게 연다.  사용: with open_pdf(경로) as (reader, 복구여부):
+
+    pypdf는 파일 내부 목차(xref)가 깨진 PDF를 만나면 오류를 내지 않고 조용히
+    '페이지 0개'로 읽어버린다. (스캐너·한글·관공서 시스템에서 만든 PDF에서 종종 발생)
+    그래서 페이지가 0개거나 읽기에 실패하면 PyMuPDF로 구조를 복구한 임시본을 만들어
+    그것을 대신 연다. 임시본은 작업이 끝나면 자동 삭제된다."""
+    pypdf = ensure_pkg("pypdf")
+    fname = fname or os.path.basename(path)
+    try:
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(f"{fname}: 내용이 없는 빈 파일(0바이트)입니다. "
+                               "파일이 제대로 복사·다운로드됐는지 확인해 주세요.")
+    except OSError:
+        pass
+    n = 0
+    reader = None
+    try:
+        reader = pypdf.PdfReader(path)
+        if reader.is_encrypted:
+            # 편집만 제한된 PDF는 빈 암호로 열린다. 열기 암호가 걸린 것은 여기서 걸러낸다.
+            try:
+                unlocked = reader.decrypt("")
+            except Exception:
+                unlocked = 0
+            if not unlocked:
+                raise RuntimeError(f"{fname}: 열기 암호가 걸린 PDF입니다. "
+                                   "암호를 풀어 저장한 뒤 다시 시도해 주세요.")
+        n = _pdf_page_count(reader)
+    except RuntimeError:
+        raise
+    except Exception:
+        n = 0
+    if n > 0:
+        yield reader, False
+        return
+
+    # --- 여기부터 자동 복구 (메모리에서 처리하므로 임시 파일 찌꺼기가 남지 않는다) ---
+    cannot_read = (f"{fname}: PDF를 읽을 수 없습니다. 파일이 손상되었거나 PDF가 아닐 수 있습니다.\n"
+                   "크롬 등에서 열어 '인쇄 → PDF로 저장'으로 다시 만든 뒤 시도해 주세요.")
+    buf = None
+    try:
+        buf = io.BytesIO(_repair_pdf_bytes(path, fname))
+        reader = pypdf.PdfReader(buf)
+        if _pdf_page_count(reader) == 0:
+            raise RuntimeError("페이지 없음")
+    except RuntimeError as e:
+        if "열기 암호" in str(e):
+            raise
+        raise RuntimeError(cannot_read)
+    except Exception:
+        raise RuntimeError(cannot_read)
+    try:
+        yield reader, True
+    finally:
+        buf.close()
+
+
 def pdf_merge(folder, files, order, out_name, ranges=None):
     pypdf = ensure_pkg("pypdf")
     items = _select_paths(folder, files, ["pdf"], order)
@@ -434,22 +527,27 @@ def pdf_merge(folder, files, order, out_name, ranges=None):
     ranges = ranges or {}
     writer = pypdf.PdfWriter()
     total_pages = 0
-    for name, path in items:
-        try:
-            reader = pypdf.PdfReader(path)
-            sel = _parse_page_ranges(ranges.get(name), len(reader.pages), name)
-            if sel is None:
-                for page in reader.pages:
-                    writer.add_page(page)
-                    total_pages += 1
-            else:
-                for idx in sel:
-                    writer.add_page(reader.pages[idx])
-                    total_pages += 1
-        except RuntimeError:
-            raise  # 페이지 범위 오류는 그대로 전달
-        except Exception as e:
-            raise RuntimeError(f"{name} 읽기 실패: {e}")
+    repaired = []          # 구조가 깨져 자동 복구한 파일 목록
+    # ExitStack: 복구용 임시본을 병합이 끝날 때까지 살려두고 마지막에 한꺼번에 정리한다
+    with contextlib.ExitStack() as stack:
+        for name, path in items:
+            try:
+                reader, was_fixed = stack.enter_context(open_pdf(path, name))
+                if was_fixed:
+                    repaired.append(name)
+                sel = _parse_page_ranges(ranges.get(name), len(reader.pages), name)
+                if sel is None:
+                    for page in reader.pages:
+                        writer.add_page(page)
+                        total_pages += 1
+                else:
+                    for idx in sel:
+                        writer.add_page(reader.pages[idx])
+                        total_pages += 1
+            except RuntimeError:
+                raise  # 페이지 범위 오류·암호 안내 등은 그대로 전달
+            except Exception as e:
+                raise RuntimeError(f"{name} 읽기 실패: {e}")
     out_name = (out_name or "병합").strip()
     if not out_name.lower().endswith(".pdf"):
         out_name += ".pdf"
@@ -457,7 +555,7 @@ def pdf_merge(folder, files, order, out_name, ranges=None):
     with open(out_path, "wb") as fh:
         writer.write(fh)
     return {"output": os.path.basename(out_path), "count": len(items),
-            "pages": total_pages, "order": order}
+            "pages": total_pages, "order": order, "repaired": repaired}
 
 
 def pdf_split(folder, file, pages_per):
@@ -473,24 +571,26 @@ def pdf_split(folder, file, pages_per):
         raise RuntimeError("분할 기준 페이지 수를 숫자로 입력하세요.")
     if pages_per < 1:
         raise RuntimeError("분할 기준 페이지 수는 1 이상이어야 합니다.")
-    reader = pypdf.PdfReader(path)
-    total = len(reader.pages)
-    if total <= pages_per:
-        raise RuntimeError(f"전체 {total}페이지뿐이라 {pages_per}페이지 기준으로 나눌 필요가 없습니다.")
-    base = os.path.splitext(os.path.basename(path))[0]
-    outdir = _unique_path(folder, base + "_분할")
-    os.makedirs(outdir, exist_ok=True)
-    parts = 0
-    for idx, start in enumerate(range(0, total, pages_per), 1):
-        writer = pypdf.PdfWriter()
-        end = min(start + pages_per, total)
-        for p in range(start, end):
-            writer.add_page(reader.pages[p])
-        part = os.path.join(outdir, f"{base}_{idx:03d}_p{start + 1}-{end}.pdf")
-        with open(part, "wb") as fh:
-            writer.write(fh)
-        parts += 1
-    return {"folder": os.path.basename(outdir), "parts": parts, "total_pages": total}
+    # open_pdf: 구조가 깨져 pypdf가 페이지를 0개로 읽는 PDF도 자동 복구해서 열어 준다
+    with open_pdf(path, os.path.basename(path)) as (reader, repaired):
+        total = len(reader.pages)
+        if total <= pages_per:
+            raise RuntimeError(f"전체 {total}페이지뿐이라 {pages_per}페이지 기준으로 나눌 필요가 없습니다.")
+        base = os.path.splitext(os.path.basename(path))[0]
+        outdir = _unique_path(folder, base + "_분할")
+        os.makedirs(outdir, exist_ok=True)
+        parts = 0
+        for idx, start in enumerate(range(0, total, pages_per), 1):
+            writer = pypdf.PdfWriter()
+            end = min(start + pages_per, total)
+            for p in range(start, end):
+                writer.add_page(reader.pages[p])
+            part = os.path.join(outdir, f"{base}_{idx:03d}_p{start + 1}-{end}.pdf")
+            with open(part, "wb") as fh:
+                writer.write(fh)
+            parts += 1
+    return {"folder": os.path.basename(outdir), "parts": parts, "total_pages": total,
+            "repaired": [os.path.basename(path)] if repaired else []}
 
 
 def pdf_delete_pages(folder, file, spec):
@@ -501,24 +601,25 @@ def pdf_delete_pages(folder, file, spec):
     path = safe_join(folder, file)
     if not os.path.isfile(path):
         raise ValueError("파일을 찾을 수 없습니다.")
-    reader = pypdf.PdfReader(path)
-    total = len(reader.pages)
-    sel = _parse_page_ranges(spec, total, os.path.basename(path))
-    if not sel:
-        raise RuntimeError("삭제할 페이지를 입력하세요. (예: 1-3, 5, 8-10)")
-    delset = set(sel)
-    keep = [i for i in range(total) if i not in delset]
-    if not keep:
-        raise RuntimeError("모든 페이지를 삭제할 수는 없습니다. 최소 1페이지는 남겨야 합니다.")
-    writer = pypdf.PdfWriter()
-    for i in keep:
-        writer.add_page(reader.pages[i])
-    base, ext = os.path.splitext(os.path.basename(path))
-    out_path = _unique_path(folder, f"{base}_페이지삭제{ext}")
-    with open(out_path, "wb") as fh:
-        writer.write(fh)
+    with open_pdf(path, os.path.basename(path)) as (reader, repaired):
+        total = len(reader.pages)
+        sel = _parse_page_ranges(spec, total, os.path.basename(path))
+        if not sel:
+            raise RuntimeError("삭제할 페이지를 입력하세요. (예: 1-3, 5, 8-10)")
+        delset = set(sel)
+        keep = [i for i in range(total) if i not in delset]
+        if not keep:
+            raise RuntimeError("모든 페이지를 삭제할 수는 없습니다. 최소 1페이지는 남겨야 합니다.")
+        writer = pypdf.PdfWriter()
+        for i in keep:
+            writer.add_page(reader.pages[i])
+        base, ext = os.path.splitext(os.path.basename(path))
+        out_path = _unique_path(folder, f"{base}_페이지삭제{ext}")
+        with open(out_path, "wb") as fh:
+            writer.write(fh)
     return {"output": os.path.basename(out_path), "removed": len(delset),
-            "remaining": len(keep), "total": total}
+            "remaining": len(keep), "total": total,
+            "repaired": [os.path.basename(path)] if repaired else []}
 
 
 def images_to_pdf(folder, files, order, out_name):
@@ -703,16 +804,16 @@ def compress_pdf(folder, files, level):
                     continue
             else:
                 pypdf = ensure_pkg("pypdf")
-                reader = pypdf.PdfReader(path)
-                writer = pypdf.PdfWriter()
-                for page in reader.pages:
-                    writer.add_page(page)
-                # compress_content_streams()는 PdfWriter에 속한 페이지에만 호출 가능
-                # (최신 pypdf에서 reader 페이지에 직접 호출하면 ValueError 발생)
-                for page in writer.pages:
-                    page.compress_content_streams()
-                with open(out_path, "wb") as fh:
-                    writer.write(fh)
+                with open_pdf(path, name) as (reader, _fixed):
+                    writer = pypdf.PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    # compress_content_streams()는 PdfWriter에 속한 페이지에만 호출 가능
+                    # (최신 pypdf에서 reader 페이지에 직접 호출하면 ValueError 발생)
+                    for page in writer.pages:
+                        page.compress_content_streams()
+                    with open(out_path, "wb") as fh:
+                        writer.write(fh)
             after = os.path.getsize(out_path)
             results.append({"name": name, "output": os.path.basename(out_path),
                             "before": before, "after": after,
@@ -3599,8 +3700,15 @@ async function runPdfOp(){
 
 function kb(n){ return n>=1048576 ? (n/1048576).toFixed(1)+"MB" : Math.round(n/1024)+"KB"; }
 
+// 파일 구조가 깨져 있어 자동 복구한 경우 안내 문구를 덧붙인다
+function fixNote(res){
+  const r = res && res.repaired;
+  if(!r || !r.length) return "";
+  return `<br><span class="hint">※ ${r.map(esc).join(", ")} 는 파일 구조가 손상되어 있어 자동 복구 후 처리했습니다. (원본은 그대로입니다)</span>`;
+}
+
 function formatPdfResult(op, res){
-  if(op==="merge")   return `✓ PDF ${res.count}개(총 ${res.pages}페이지)를 합쳤습니다 → <b>${esc(res.output)}</b>`;
+  if(op==="merge")   return `✓ PDF ${res.count}개(총 ${res.pages}페이지)를 합쳤습니다 → <b>${esc(res.output)}</b>` + fixNote(res);
   if(op==="img2pdf") return `✓ 이미지 ${res.count}장을 묶었습니다 → <b>${esc(res.output)}</b>`;
   if(op==="pdf2img"){
     const ok = res.results.filter(r=>!r.error);
@@ -3620,8 +3728,8 @@ function formatPdfResult(op, res){
   }
   if(op==="split"){
     if(res.removed!==undefined)
-      return `✓ ${res.removed}개 페이지를 삭제했습니다 (남은 ${res.remaining}p / 원본 ${res.total}p) → <b>${esc(res.output)}</b>`;
-    return `✓ ${res.parts}개로 분할했습니다 (총 ${res.total_pages}p) → <b>${esc(res.folder)}/</b> 폴더`;
+      return `✓ ${res.removed}개 페이지를 삭제했습니다 (남은 ${res.remaining}p / 원본 ${res.total}p) → <b>${esc(res.output)}</b>` + fixNote(res);
+    return `✓ ${res.parts}개로 분할했습니다 (총 ${res.total_pages}p) → <b>${esc(res.folder)}/</b> 폴더` + fixNote(res);
   }
   if(op==="compress"){
     const ok = res.results.filter(r=>!r.error);
