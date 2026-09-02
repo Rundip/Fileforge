@@ -26,10 +26,10 @@ jobs:
 
     steps:
       - name: 소스 내려받기
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 파이썬 준비
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -59,7 +59,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: 빌드 결과 보관 (릴리스와 별개로 90일간 보관)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FileForge-exe
           path: dist/FileForge.exe
