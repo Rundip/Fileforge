@@ -15,13 +15,24 @@
 
 **브라우저 탭을 닫으면 서버 프로세스까지 완전히 종료됩니다.** (하트비트 감시 → 남는 프로세스 없음)
 
-## 실행 방법 (Windows)
+## 받는 방법 (Windows · 설치 불필요) ⭐
+
+**[▶ FileForge.exe 내려받기](https://github.com/Rundip/Fileforge/releases/latest/download/FileForge.exe)**
+
+브라우저로 눌러 받은 뒤 더블클릭하면 끝입니다. Python을 비롯해 아무것도 설치할 필요가 없습니다.
+main 브랜치에 코드가 올라가면 GitHub Actions가 윈도우에서 자동으로 EXE를 빌드해
+[Releases](https://github.com/Rundip/Fileforge/releases/latest)에 올리므로, 위 주소는 **항상 최신 버전**을 가리킵니다.
+
+> 처음 실행할 때 `Windows의 PC 보호` 파란 경고창이 뜨면 **추가 정보 → 실행**을 누르세요.
+> 코드 서명 인증서를 붙이지 않은 프로그램이라 나타나는 정상적인 경고입니다.
+
+## 실행 방법 (Windows · 소스로 실행)
 
 1. [python.org](https://www.python.org/downloads/)에서 Python을 설치합니다.
    (설치 시 **"Add Python to PATH"** 체크 권장)
 2. `파일명일괄변경_윈도우용.pyw` 파일을 **더블클릭**하면 바로 실행됩니다.
 
-> Python 없이 쓰고 싶다면 아래 "EXE로 만들기"를 참고하세요.
+> Python 없이 쓰고 싶다면 위 "받는 방법" 또는 아래 "EXE로 만들기"를 참고하세요.
 
 ## 사용 순서
 

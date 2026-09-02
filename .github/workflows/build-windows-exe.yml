@@ -1,0 +1,81 @@
+# 윈도우 EXE 자동 빌드
+#
+# main 브랜치에 코드가 올라가면 깃허브가 빌려주는 윈도우 컴퓨터에서
+# FileForge.exe 를 자동으로 만들어 Releases(배포판)에 올린다.
+# 사무실 PC는 아무것도 설치할 필요 없이 브라우저로 내려받기만 하면 된다.
+#
+# 항상 최신 EXE 를 받는 주소 (이 주소는 바뀌지 않는다):
+#   https://github.com/Rundip/Fileforge/releases/latest/download/FileForge.exe
+
+name: 윈도우 EXE 자동 빌드
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # 깃허브 화면에서 수동으로도 실행 가능
+
+permissions:
+  contents: write           # Releases 에 파일을 올리기 위해 필요
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"           # 한글 파일명·한글 출력이 깨지지 않게
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: 소스 내려받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 필요한 부품 설치
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pypdf Pillow pywin32 openpyxl pymupdf
+          # HEIC(아이폰 사진) 읽기용. 가벼운 pi-heif 를 먼저 쓰고, 안 되면 pillow-heif 로.
+          python -m pip install pi-heif || python -m pip install pillow-heif
+
+      - name: EXE 만들기
+        shell: bash
+        run: pyinstaller FileForge.spec --noconfirm --clean
+
+      - name: 결과 확인
+        shell: bash
+        run: |
+          test -f dist/FileForge.exe || { echo "EXE 가 만들어지지 않았습니다"; exit 1; }
+          SIZE_MB=$(python -c "import os;print(round(os.path.getsize('dist/FileForge.exe')/1048576,1))")
+          SHA=$(python -c "import hashlib;print(hashlib.sha256(open('dist/FileForge.exe','rb').read()).hexdigest())")
+          echo "완성: FileForge.exe (${SIZE_MB} MB)"
+          {
+            echo "SIZE_MB=${SIZE_MB}"
+            echo "SHA256=${SHA}"
+            echo "TAG=build-$(date -u +%Y%m%d-%H%M)"
+          } >> "$GITHUB_ENV"
+
+      - name: 빌드 결과 보관 (릴리스와 별개로 90일간 보관)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileForge-exe
+          path: dist/FileForge.exe
+          retention-days: 90
+
+      - name: Releases 에 올리기
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          # 안내문 템플릿의 자리표시자를 실제 값으로 채운다
+          python .github/make_release_notes.py > release-notes.md
+          gh release create "$TAG" dist/FileForge.exe \
+            --repo "$REPO" \
+            --title "FileForge $TAG" \
+            --notes-file release-notes.md \
+            --latest
