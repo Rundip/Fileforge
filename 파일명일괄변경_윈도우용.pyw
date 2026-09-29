@@ -976,14 +976,18 @@ def _hwp_save_pdf(hwp, out_path):
     return os.path.exists(out_path)
 
 
+# 한글 문서와 한글 서식 파일. .hwt 는 .hwp, .hwtx 는 .hwpx 와 속 구조가 같아 한글이 똑같이 연다.
+HWP_EXTS = ["hwp", "hwpx", "hwt", "hwtx"]
+
+
 def hwp_to_pdf(folder, files):
-    """한글 문서(.hwp/.hwpx)를 PDF로 변환.
+    """한글 문서(.hwp/.hwpx/.hwt/.hwtx)를 PDF로 변환.
     1순위: 한글(Hancom Office) COM 자동화 — 서식을 그대로 재현
     2순위: LibreOffice — 한글이 없을 때 (복잡한 서식은 일부 차이가 날 수 있음)
     """
-    items = _select_paths(folder, files, ["hwp", "hwpx"])
+    items = _select_paths(folder, files, HWP_EXTS)
     if not items:
-        raise RuntimeError("한글 파일(.hwp/.hwpx)을 선택하세요.")
+        raise RuntimeError("한글 파일(.hwp·.hwpx·.hwt·.hwtx)을 선택하세요.")
 
     hwp = find_hwp_com()
     if hwp is not None:
@@ -1033,6 +1037,125 @@ def hwp_to_pdf(folder, files):
         except Exception as e:
             results.append({"name": name, "error": str(e)})
     return {"results": results, "engine": "libreoffice"}
+
+
+# ---------------- 워드 → PDF ----------------
+# 워드가 여는 보편적인 문서 형식. 서식 파일(.dot/.dotx/.dotm)도 문서처럼 PDF 로 만든다.
+WORD_EXTS = ["doc", "docx", "docm", "dot", "dotx", "dotm", "rtf", "odt"]
+
+
+def find_word_com():
+    """Microsoft Word COM 객체를 '새 인스턴스'로 만든다. Word 가 없으면 None.
+
+    사용자가 열어 둔 Word 에 붙으면, 변환을 마치고 닫을 때 그 창까지 닫힐 수 있다.
+    그래서 늘 따로 떨어진 Word 를 띄워 쓰고, 끝나면 그것만 닫는다."""
+    if os.name != "nt":
+        return None
+    try:
+        import win32com.client as win32
+    except ImportError:
+        try:
+            ensure_pkg("win32com.client", "pywin32")
+            import win32com.client as win32
+        except Exception:
+            return None
+    try:
+        word = win32.DispatchEx("Word.Application")
+    except Exception:
+        return None                          # Word 가 설치돼 있지 않음
+    try:
+        word.Visible = False
+        word.DisplayAlerts = 0               # 확인 창을 띄우지 않는다 (wdAlertsNone)
+        word.AutomationSecurity = 3          # .docm/.dotm 의 매크로를 실행하지 않는다 (ForceDisable)
+    except Exception:
+        pass
+    return word
+
+
+def _word_error(e):
+    """Word COM 오류를 사람이 읽을 수 있는 한 줄로 바꾼다."""
+    text = ""
+    try:
+        info = e.args[2]                     # (코드, 출처, 설명, …)
+        if info and info[2]:
+            text = str(info[2])
+    except Exception:
+        pass
+    text = (text or str(e)).strip()
+    if "암호" in text or "password" in text.lower():
+        return "여는 암호가 걸린 문서입니다. 워드에서 암호를 풀어 저장한 뒤 다시 시도하세요."
+    return text[:200]
+
+
+def _soffice_to_pdf(folder, items, soffice, fail_msg):
+    """LibreOffice 로 파일마다 PDF 를 만들어 folder 에 저장하고 결과 목록을 돌려준다."""
+    results = []
+    for name, path in items:
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                r = subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", td, path],
+                                   capture_output=True, text=True, timeout=600)
+                produced = os.path.join(td, os.path.splitext(os.path.basename(path))[0] + ".pdf")
+                if os.path.exists(produced):
+                    dst = _unique_path(folder, os.path.splitext(name)[0] + ".pdf")
+                    shutil.move(produced, dst)
+                    results.append({"name": name, "output": os.path.basename(dst)})
+                else:
+                    results.append({"name": name, "error": (r.stderr or fail_msg)[:200]})
+        except Exception as e:
+            results.append({"name": name, "error": str(e)})
+    return results
+
+
+def word_to_pdf(folder, files):
+    """워드 문서(.docx/.doc/.docm/.dot/.dotx/.dotm/.rtf/.odt)를 PDF로 변환.
+    1순위: Microsoft Word — 서식을 그대로 재현
+    2순위: LibreOffice — Word 가 없을 때 (복잡한 서식은 일부 차이가 날 수 있음)
+    원본은 그대로 두고, 같은 이름의 PDF 를 만든다(이미 있으면 _1, _2 …)."""
+    items = _select_paths(folder, files, WORD_EXTS)
+    if not items:
+        raise RuntimeError("워드 파일(.docx·.doc 등)을 선택하세요.")
+
+    word = find_word_com()
+    if word is not None:
+        results = []
+        try:
+            for name, path in items:
+                doc = None
+                try:
+                    out_path = _unique_path(folder, os.path.splitext(name)[0] + ".pdf")
+                    # PasswordDocument 에 아무 값이나 넣어 두면, 여는 암호가 걸린 문서에서
+                    # 암호 입력 창을 띄우고 멈추는 대신 곧바로 오류가 난다. 암호 없는 문서는 이 값을 무시한다.
+                    doc = word.Documents.Open(path, ConfirmConversions=False, ReadOnly=True,
+                                              AddToRecentFiles=False, PasswordDocument="fileforge-no-pw",
+                                              Visible=False, NoEncodingDialog=True)
+                    doc.ExportAsFixedFormat(out_path, 17)          # 17 = PDF
+                    if os.path.exists(out_path):
+                        results.append({"name": name, "output": os.path.basename(out_path)})
+                    else:
+                        results.append({"name": name, "error": "PDF 저장 실패"})
+                except Exception as e:
+                    results.append({"name": name, "error": _word_error(e)})
+                finally:
+                    if doc is not None:
+                        try:
+                            doc.Close(SaveChanges=0)               # 원본은 저장하지 않고 닫는다
+                        except Exception:
+                            pass
+        finally:
+            try:
+                word.Quit(SaveChanges=0)
+            except Exception:
+                pass
+        return {"results": results, "engine": "word"}
+
+    # ----- Word 가 없으면 LibreOffice -----
+    soffice = find_soffice()
+    if not soffice:
+        raise RuntimeError("워드→PDF 변환에는 Microsoft Word 또는 LibreOffice가 필요합니다.\n"
+                           "· Word가 설치돼 있으면 자동으로 사용합니다.\n"
+                           "· 없으면 https://www.libreoffice.org/download 에서 LibreOffice(무료)를 설치한 뒤 다시 시도하세요.")
+    return {"results": _soffice_to_pdf(folder, items, soffice, "변환 실패"), "engine": "libreoffice"}
 
 
 # ---------------- 엑셀 합치기 도구 ----------------
@@ -2179,6 +2302,7 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
       <button class="chip" data-op="compress" onclick="pickPdfOp(this)">PDF 용량 줄이기</button>
       <button class="chip" data-op="excel2pdf" onclick="pickPdfOp(this)">엑셀 → PDF</button>
       <button class="chip" data-op="hwp2pdf" onclick="pickPdfOp(this)">한글 → PDF</button>
+      <button class="chip" data-op="word2pdf" onclick="pickPdfOp(this)">워드 → PDF</button>
       <button class="chip" data-op="xlsmerge" onclick="pickPdfOp(this)">엑셀 시트 합치기</button>
       <button class="chip" data-op="xlsappend" onclick="pickPdfOp(this)">엑셀 행 통합</button>
     </div>
@@ -3889,7 +4013,8 @@ const PDF_EXTS = {
   img2pdf:["jpg","jpeg","png","bmp","tif","tiff","gif","webp"],
   img2img:["jpg","jpeg","png","bmp","gif","tif","tiff","webp","heic","heif","pdf"],
   excel2pdf:["xlsx","xls","xlsm","ods","csv"],
-  hwp2pdf:["hwp","hwpx"],
+  hwp2pdf:["hwp","hwpx","hwt","hwtx"],
+  word2pdf:["doc","docx","docm","dot","dotx","dotm","rtf","odt"],
   xlsmerge:["xlsx","xlsm"], xlsappend:["xlsx","xlsm"],
 };
 const PDF_EMPTY = {
@@ -3897,7 +4022,8 @@ const PDF_EMPTY = {
   compress:"이 폴더에 PDF가 없습니다.", pdf2img:"이 폴더에 PDF가 없습니다.",
   img2pdf:"이 폴더에 이미지가 없습니다.", img2img:"이 폴더에 이미지·PDF가 없습니다.",
   excel2pdf:"이 폴더에 엑셀 파일이 없습니다.",
-  hwp2pdf:"이 폴더에 한글 파일(.hwp/.hwpx)이 없습니다.",
+  hwp2pdf:"이 폴더에 한글 파일(.hwp·.hwpx·.hwt·.hwtx)이 없습니다.",
+  word2pdf:"이 폴더에 워드 파일(.docx·.doc·.docm·.dotx·.dot·.dotm·.rtf·.odt)이 없습니다.",
   xlsmerge:"이 폴더에 엑셀 파일(.xlsx/.xlsm)이 없습니다.",
   xlsappend:"이 폴더에 엑셀 파일(.xlsx/.xlsm)이 없습니다.",
 };
@@ -3952,8 +4078,10 @@ function renderPdfOptions(){
     <select class="field" id="pdfLevel"><option value="high">강 — 가장 작게</option>
     <option value="medium" selected>중 — 균형</option><option value="low">약 — 화질 우선</option></select></div>`;
   else if(op==="excel2pdf") h = `<p class="hint">선택한 엑셀 파일을 각각 PDF로 변환합니다. (LibreOffice 필요 · 서식 유지)</p>`;
-  else if(op==="hwp2pdf") h = `<p class="hint">선택한 한글 문서(.hwp/.hwpx)를 각각 PDF로 변환합니다. 원본은 그대로 두고 같은 이름의 PDF를 만듭니다.<br>
+  else if(op==="hwp2pdf") h = `<p class="hint">선택한 한글 문서(.hwp·.hwpx)와 한글 서식 파일(.hwt·.hwtx)을 각각 PDF로 변환합니다. 원본은 그대로 두고 같은 이름의 PDF를 만듭니다.<br>
     한글(아래아한글)이 설치돼 있으면 자동으로 사용해 서식을 그대로 재현하고, 없으면 LibreOffice로 변환합니다.</p>`;
+  else if(op==="word2pdf") h = `<p class="hint">선택한 워드 문서(.docx·.doc·.docm·.rtf·.odt)와 워드 서식 파일(.dotx·.dot·.dotm)을 각각 PDF로 변환합니다. 원본은 그대로 두고 같은 이름의 PDF를 만듭니다.<br>
+    Microsoft Word가 설치돼 있으면 자동으로 사용해 서식을 그대로 재현하고, 없으면 LibreOffice로 변환합니다. (문서 안의 매크로는 실행하지 않습니다)</p>`;
   else if(op==="xlsmerge") h = `<p class="hint">선택한 엑셀 파일들의 <b>모든 시트</b>를 하나의 새 워크북으로 모읍니다. (원본 유지 · .xlsx/.xlsm)</p>`
     + `<div class="row"><span class="hint">시트 순서</span>
        <select class="field" id="pdfOrder">
@@ -4196,6 +4324,7 @@ async function runPdfOp(){
   else if(op==="compress")res = await api("/api/compress",{folder:state.folder, files, level:gv("pdfLevel","medium")});
   else if(op==="excel2pdf")res= await api("/api/excel2pdf",{folder:state.folder, files});
   else if(op==="hwp2pdf")  res= await api("/api/hwp2pdf",  {folder:state.folder, files});
+  else if(op==="word2pdf") res= await api("/api/word2pdf", {folder:state.folder, files});
   else if(op==="xlsmerge") res= await api("/api/xlsmerge", {folder:state.folder, files, order:gv("pdfOrder","asc"), out:gv("pdfOut","")});
   else if(op==="xlsappend")res= await api("/api/xlsappend",{folder:state.folder, files, out:gv("pdfOut",""), skipHeader:($("pdfSkipHeader")?$("pdfSkipHeader").checked:true)});
 
@@ -4253,10 +4382,10 @@ function formatPdfResult(op, res){
     if(fail.length) m += `<br><span class="warn">실패 ${fail.length}건: ${fail.map(r=>esc(r.name)).join(", ")}</span>`;
     return m;
   }
-  if(op==="hwp2pdf"){
+  if(op==="hwp2pdf" || op==="word2pdf"){
     const ok = res.results.filter(r=>!r.error);
     const fail = res.results.filter(r=>r.error);
-    const eng = res.engine==="hancom" ? "한글" : "LibreOffice";
+    const eng = {hancom:"한글", word:"Word"}[res.engine] || "LibreOffice";
     let m = `✓ ${ok.length}개 변환 완료 [${eng}]` + (ok.length? "<br>"+ok.map(r=>esc(r.output)).join("<br>") : "");
     if(fail.length) m += `<br><span class="warn">실패 ${fail.length}건: ${fail.map(r=>`${esc(r.name)}${r.error?" ("+esc(r.error)+")":""}`).join(", ")}</span>`;
     return m;
@@ -4455,7 +4584,7 @@ class Handler(BaseHTTPRequestHandler):
                 folder = body.get("folder", "")
                 if self.path in ("/api/merge", "/api/split", "/api/pdfdelete", "/api/img2pdf",
                                  "/api/pdf2img", "/api/img2img", "/api/compress", "/api/excel2pdf",
-                                 "/api/hwp2pdf", "/api/xlsmerge", "/api/xlsappend"):
+                                 "/api/hwp2pdf", "/api/word2pdf", "/api/xlsmerge", "/api/xlsappend"):
                     if not os.path.isdir(folder):
                         return self._json({"error": "폴더를 먼저 선택하세요."})
 
@@ -4486,6 +4615,8 @@ class Handler(BaseHTTPRequestHandler):
                     pdf_result = excel_to_pdf(folder, body.get("files", []))
                 elif self.path == "/api/hwp2pdf":
                     pdf_result = hwp_to_pdf(folder, body.get("files", []))
+                elif self.path == "/api/word2pdf":
+                    pdf_result = word_to_pdf(folder, body.get("files", []))
                 elif self.path == "/api/xlsmerge":
                     pdf_result = excel_merge_sheets(folder, body.get("files", []),
                                                     body.get("order", "asc"), body.get("out", ""))
