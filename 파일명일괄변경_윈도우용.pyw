@@ -85,6 +85,12 @@ def safe_join(folder, rel):
     base = os.path.realpath(folder)
     if not target.startswith(base + os.sep):
         raise ValueError(f"허용되지 않는 경로: {rel}")
+    # realpath 는 이미 있는 이름이면 디스크에 적힌 대소문자로 바꿔서 돌려준다.
+    # 그러면 'abc' → 'ABC' 처럼 대소문자만 바꾸는 요청이 원래 이름으로 되돌아가
+    # 성공했다고 나오면서 실제로는 아무것도 안 바뀐다. 마지막 이름은 요청한 글자 그대로 쓴다.
+    want = os.path.basename(os.path.normpath(rel))
+    if want and os.path.basename(target).lower() == want.lower():
+        target = os.path.join(os.path.dirname(target), want)
     return target
 
 
@@ -199,14 +205,37 @@ def execute_jobs(folder, jobs, mode, folders=None):
 
 def undo_last():
     if not UNDO_STACK:
-        return 0, []
+        return 0, [], 0
     last = UNDO_STACK.pop()
     errors = []
+    # 하나씩 곧장 되돌리면, 이름을 맞바꾼 경우(1→2, 2→1)나 이어서 바꾼 경우(A→B, B→C)
+    # 되돌릴 자리를 아직 다른 항목이 차지하고 있다. 그때 shutil.move 는 폴더면 그 안으로
+    # 들어가 버리고, 파일이면 덮어써서 내용이 사라졌다. 그래서 실행할 때처럼 두 단계로 한다:
+    # ① 모두 임시 이름으로 옮겨 자리를 비우고 ② 원래 이름으로 돌려놓는다.
+    temps = []
     for cur, old in reversed(last["moves"]):
+        tmp = cur + ".undo_" + uuid.uuid4().hex[:8]
+        try:
+            os.rename(cur, tmp)
+            temps.append((tmp, cur, old))
+        except OSError as e:
+            errors.append(f"{os.path.basename(cur)}: {e}")
+    restored = 0
+    for tmp, cur, old in temps:
         try:
             os.makedirs(os.path.dirname(old), exist_ok=True)
-            shutil.move(cur, old)
+            if os.path.exists(old):
+                # 그 사이 다른 항목이 원래 자리를 차지했다 — 덮어쓰지 않고 그대로 둔다
+                os.rename(tmp, cur)
+                errors.append(f"{os.path.basename(old)}: 원래 자리에 다른 항목이 있어 되돌리지 않았습니다")
+                continue
+            shutil.move(tmp, old)
+            restored += 1
         except OSError as e:
+            try:
+                os.rename(tmp, cur)
+            except OSError:
+                pass
             errors.append(f"{os.path.basename(cur)}: {e}")
     removed_dirs = 0
     for d in reversed(last["dirs"]):
@@ -221,7 +250,7 @@ def undo_last():
         dirs.add(os.path.dirname(old))
     dirs.update(last["dirs"])
     notify_shell_change(dirs)
-    return len(last["moves"]), errors, removed_dirs
+    return restored, errors, removed_dirs
 
 
 def make_dirs(folder, names, moves=None):
