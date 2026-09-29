@@ -135,6 +135,57 @@ def list_files(folder, exts, include="files"):
     return items, all_names
 
 
+# 탐색기가 기본으로 감추는 숨김·시스템 폴더($RECYCLE.BIN 등)
+_HIDDEN_ATTRS = 0x2 | 0x4      # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+
+
+def list_subdirs(folder):
+    """폴더 '바로 안'의 하위 폴더 목록을 자연순으로 돌려준다.
+
+    탐색기에서 안 보이는 숨김·시스템 폴더는 목록에서 뺀다. 대신 그 이름과
+    같은 폴더의 파일 이름은 others 로 함께 돌려준다 — 폴더 이름을 바꿀 때
+    이미 있는 이름과 겹치는지 확인하는 데 쓴다."""
+    dirs, others = [], []
+    with os.scandir(folder) as it:
+        for entry in it:
+            name = entry.name
+            try:
+                is_dir = entry.is_dir()
+                st = entry.stat()
+            except OSError:
+                continue
+            if not is_dir:
+                others.append(name)
+                continue
+            if name.startswith(".") or (getattr(st, "st_file_attributes", 0) & _HIDDEN_ATTRS):
+                others.append(name)          # 목록엔 안 보여도 이름은 차지하고 있다
+                continue
+            dirs.append({"name": name, "mtime": st.st_mtime})
+    dirs.sort(key=lambda d: _natkey(d["name"]))
+    return dirs, others
+
+
+_BAD_NAME_CHARS = set('\\/:*?"<>|')
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} \
+                  | {"LPT%d" % i for i in range(1, 10)}
+
+
+def check_dir_name(name):
+    """윈도우에서 폴더 이름으로 쓸 수 없으면 그 이유를, 괜찮으면 None 을 돌려준다.
+    (화면에서도 같은 검사를 하지만, 서버에서 한 번 더 막는다)"""
+    if not name or not name.strip():
+        return "이름이 비어 있습니다"
+    if any(c in _BAD_NAME_CHARS or ord(c) < 32 for c in name):
+        return '\\ / : * ? " < > | 는 폴더 이름에 쓸 수 없습니다'
+    if name != name.rstrip(" ."):
+        return "이름 끝에 공백이나 마침표를 둘 수 없습니다"
+    if name.split(".")[0].strip().upper() in _RESERVED_NAMES:
+        return "윈도우 예약어라 쓸 수 없습니다"
+    if len(name) > 255:
+        return "이름이 너무 깁니다"
+    return None
+
+
 def execute_jobs(folder, jobs, mode, folders=None):
     """jobs: [{"src": 파일명, "dst": 상대경로, "d": 폴더번호}] — 검증 후 실행, undo 배치 반환
 
@@ -1709,6 +1760,42 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
      메뉴가 화면 밖으로 넘치므로, 화면 좌우 여백에 맞춰 편다. */
   .recent-menu{position:fixed;left:24px;right:24px;min-width:0;max-width:none}
 }
+
+/* ===== 폴더 목록 ===== */
+.dirlead{margin:4px 0 6px}
+.dirbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}
+.dirbar .field{height:40px;padding:8px 16px;font-size:14px}
+#dirFilter{flex:1 1 280px;min-width:200px;width:auto}
+#dirFilterMode{width:auto}
+#dirFind,#dirRepl{width:170px}
+.dirhead,.dirrow{display:grid;grid-template-columns:40px minmax(0,1fr) minmax(0,1.2fr) 160px 64px;
+  gap:12px;align-items:center}
+.dirhead{margin-top:22px;padding:10px 0;font-size:12px;font-weight:500;color:var(--mute);
+  border-bottom:1px solid var(--hairline)}
+.dirrow{padding:6px 0;border-bottom:1px solid var(--hairline-soft);cursor:pointer}
+.dirrow:hover,.dirrow.sel{background:var(--cloud)}
+.dirrow:hover .dirname,.dirrow.sel .dirname{background:var(--canvas)}
+.dirchk{width:18px;height:18px;margin:0 auto;display:block;accent-color:var(--ink);cursor:pointer}
+.dircur{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dirrow .dirname{width:100%;box-sizing:border-box;height:36px;padding:6px 14px;font-size:14px}
+.dirrow.changed .dirname{border-color:var(--success)}
+.dirrow.bad .dirname{border-color:var(--sale)}
+.dirrow .dirname:focus{border-color:var(--ink)}
+.dirmsg{font-size:12px;font-weight:500;color:var(--mute);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dirrow.changed .dirmsg{color:var(--success)}
+.dirrow.bad .dirmsg{color:var(--sale)}
+.dirmsg:empty{visibility:hidden}
+.dirrow .diropen{opacity:0;transition:opacity .12s;margin:0}
+.dirrow:hover .diropen,.dirrow .diropen:focus{opacity:1}
+#dirRows{max-height:62vh;overflow:auto}
+@media (max-width:960px){
+  .dirhead,.dirrow{grid-template-columns:32px minmax(0,1fr) minmax(0,1fr)}
+  .dirhead span:nth-child(n+4),.dirrow .diropen{display:none}
+  .dirrow .dirmsg{grid-column:2/-1}
+  .dirrow .dirmsg:empty{display:none}
+  .nav-tabs{flex-wrap:wrap;row-gap:0}
+}
 </style>
 </head>
 <body>
@@ -1723,6 +1810,7 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
     <button class="nav-tab active" data-tab="rename" onclick="switchTab('rename')">이름 변경</button>
     <button class="nav-tab" data-tab="organize" onclick="switchTab('organize')">폴더 정리</button>
     <button class="nav-tab" data-tab="make" onclick="switchTab('make')">폴더 만들기</button>
+    <button class="nav-tab" data-tab="dirs" onclick="switchTab('dirs')">폴더 목록</button>
     <button class="nav-tab" data-tab="pdf" onclick="switchTab('pdf')">PDF · 변환</button>
   </div>
   <input id="extFilter" class="search-pill" placeholder="확장자 필터 (jpg,png)"
@@ -2042,6 +2130,44 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
   </section>
 
   <!-- ===== PDF · 변환 탭 ===== -->
+  <section id="tab-dirs" style="display:none">
+    <div class="section-head"><h2>폴더 목록</h2><span class="count">폴더 이름 복사 · 한꺼번에 이름 바꾸기</span></div>
+    <p class="hint dirlead">선택한 폴더 <b>바로 안</b>의 폴더를 모두 보여줍니다. 줄을 누르면 선택되고(Shift 로 범위 선택),
+      오른쪽 칸에서 이름을 바로 고칠 수 있습니다.<br>
+      <b>한꺼번에 바꾸는 법</b> — <b>전체 복사</b> → 엑셀에서 고치기 → 고친 목록을 오른쪽 <b>첫 칸에 붙여넣기</b> → <b>Ctrl+Enter</b>.
+      엑셀에서 <b>기존 이름 | 새 이름</b> 두 칸을 함께 붙여넣으면 순서가 달라도 이름끼리 맞춰 들어갑니다.</p>
+
+    <div class="dirbar">
+      <input class="field" id="dirFilter" placeholder="키워드로 거르기 — 쉼표로 여러 개 (예: 2024, 보고서)" oninput="onDirFilter()">
+      <select class="field" id="dirFilterMode" onchange="onDirFilter()">
+        <option value="in">키워드가 들어간 폴더만</option>
+        <option value="out">키워드가 들어간 폴더 빼고</option>
+      </select>
+      <span class="hint" id="dirInfo"></span>
+    </div>
+    <div class="dirbar">
+      <button class="btn btn-secondary btn-sm" id="dirCopySel" onclick="copyDirs('sel')" disabled>선택한 폴더 복사</button>
+      <button class="btn btn-secondary btn-sm" id="dirCopyAll" onclick="copyDirs('view')" disabled>전체 복사</button>
+      <label class="opt"><input type="checkbox" id="dirFullPath"> 전체 경로로 복사</label>
+      <span class="hint">복사하면 한 줄에 폴더 하나씩 들어갑니다 · 단축키 Ctrl+C (선택이 없으면 보이는 목록 전체)</span>
+    </div>
+
+    <div class="dirhead">
+      <label title="보이는 폴더 모두 선택"><input type="checkbox" class="dirchk" id="dirAll" onchange="dirToggleAll(this.checked)"></label>
+      <span>현재 폴더명</span><span>새 이름 — 바꿀 것만 고치세요 (Enter 아래로 · Esc 되돌리기)</span><span></span><span></span>
+    </div>
+    <div id="dirRows"><div class="empty">상단의 <b>폴더 선택</b>으로 폴더를 지정하세요.</div></div>
+
+    <div class="dirbar">
+      <span class="hint">찾아 바꾸기</span>
+      <input class="field" id="dirFind" placeholder="찾을 글자" onkeydown="if(event.key==='Enter'){event.preventDefault();dirReplaceAll();}">
+      <input class="field" id="dirRepl" placeholder="바꿀 글자" onkeydown="if(event.key==='Enter'){event.preventDefault();dirReplaceAll();}">
+      <button class="btn btn-secondary btn-sm" onclick="dirReplaceAll()">새 이름에 적용</button>
+      <span class="hint">선택한 폴더에만 (선택이 없으면 보이는 폴더 전체)</span>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="dirResetAll()">입력 모두 되돌리기</button>
+    </div>
+  </section>
+
   <section id="tab-pdf" style="display:none">
     <div class="section-head"><h2>PDF · 변환</h2><span class="count">작업을 고르고, 아래 목록에서 파일을 선택하세요</span></div>
     <div class="chips" id="pdfOps">
@@ -2130,6 +2256,7 @@ let state = {folder:"", files:[], allNames:[], dirs:[], tab:"rename", org:"categ
              preview:[], canUndo:false, perText:{}, nApply:0, nConflict:0,
              pdfOp:"merge", pdfFiles:[], pdfFilesOrig:[], pdfSeq:{}, pdfSelected:new Set(), pdfRanges:{}, keywords:[], mapRules:[],
              mapFolders:[], mapScan:[],
+             dirList:[], dirOthers:[], dirFolder:"", dirSel:new Set(), dirNew:{}, dirAnchor:null,
              renameTarget:"files", loadedInclude:"", mkMode:"list", mkPlan:null};
 const $ = id => document.getElementById(id);
 
@@ -2183,6 +2310,7 @@ async function reload(silent){
   savePrefs();
   recompute();
   if(state.tab==="pdf") loadPdfFiles();
+  if(state.tab==="dirs") await loadDirs();   // 폴더를 바꾸거나 되돌리기 뒤에도 목록을 새로 읽는다
 }
 
 async function switchTab(tab){
@@ -2192,12 +2320,15 @@ async function switchTab(tab){
   $("tab-organize").style.display = tab==="organize" ? "" : "none";
   $("tab-make").style.display = tab==="make" ? "" : "none";
   $("tab-pdf").style.display = tab==="pdf" ? "" : "none";
-  $("previewSection").style.display = (tab==="pdf" || tab==="make") ? "none" : "";
+  $("tab-dirs").style.display = tab==="dirs" ? "" : "none";
+  $("previewSection").style.display = (tab==="pdf" || tab==="make" || tab==="dirs") ? "none" : "";
   document.querySelector(".actionbar").style.display = tab==="pdf" ? "none" : "";
   $("btnRun").textContent = tab==="organize" ? "정리 실행 (Ctrl+Enter)"
-                          : tab==="make" ? "폴더 만들기 (Ctrl+Enter)" : "변경 실행 (Ctrl+Enter)";
+                          : tab==="make" ? "폴더 만들기 (Ctrl+Enter)"
+                          : tab==="dirs" ? "이름 변경 (Ctrl+Enter)" : "변경 실행 (Ctrl+Enter)";
   savePrefs();
   if(tab==="pdf"){ renderPdfOptions(); loadPdfFiles(); return; }
+  if(tab==="dirs"){ renderDirs(); await loadDirs(); return; }
   // 탭마다 필요한 목록이 달라서(폴더 포함 여부) 다르면 다시 불러온다
   if(state.folder && neededInclude() !== state.loadedInclude){ await reload(); return; }
   recompute();
@@ -2622,6 +2753,7 @@ function updatePadExamples(){
 function recompute(){
   updatePadExamples();
   if(state.tab==="make"){ renderMake(); return; }   // 폴더 만들기 탭은 별도 미리보기
+  if(state.tab==="dirs"){ renderDirs(); return; }    // 폴더 목록 탭도 별도 화면
   document.body.classList.toggle("textcol", state.tab!=="organize" && (ruleOn("pertext") || rebuildPerfileOn()));
   computePreview();
   render();
@@ -2850,6 +2982,7 @@ function showDialog(title, bodyHtml, okLabel, onOk, cancelLabel, onCancel){
 
 function askExecute(){
   if(state.tab==="make") return askMake();
+  if(state.tab==="dirs") return askRenameDirs();
   const organize = state.tab==="organize";
   const jobs = [];
   state.files.forEach((f,i)=>{
@@ -3278,6 +3411,349 @@ function renderHistory(){
   }).join("");
 }
 
+// ================= 폴더 목록 =================
+// 선택한 폴더 '바로 안'의 폴더들을 보여주고, 이름을 복사하거나 한꺼번에 고친다.
+// 쓰임새: 폴더 이름을 엑셀·문서로 옮기기, 탐색기에서 하나씩 바꾸던 이름을 한 번에 바꾸기.
+// 새 이름은 state.dirNew[기존 이름] 에만 담아 두고, 실행하기 전까지는 아무것도 바뀌지 않는다.
+let dirListToken = 0;
+
+async function loadDirs(){
+  const token = ++dirListToken;
+  const folder = state.folder;
+  if(!folder){ state.dirList = []; state.dirOthers = []; state.dirFolder = ""; renderDirs(); return; }
+  const res = await api("/api/subdirs", {folder});
+  if(token !== dirListToken || folder !== state.folder) return;     // 낡은 답은 버린다
+  if(state.dirFolder !== folder){                 // 다른 폴더로 바뀌면 선택·입력은 새로 시작
+    state.dirSel = new Set(); state.dirNew = {}; state.dirAnchor = null;
+  }
+  state.dirFolder = folder;
+  if(res.error){ state.dirList = []; state.dirOthers = []; renderDirs(res.error); return; }
+  state.dirList = res.dirs || [];
+  state.dirOthers = res.others || [];
+  const names = new Set(state.dirList.map(d=>d.name));
+  for(const k of Object.keys(state.dirNew)) if(!names.has(k)) delete state.dirNew[k];
+  for(const k of [...state.dirSel]) if(!names.has(k)) state.dirSel.delete(k);
+  renderDirs();
+}
+
+function dirKeywords(){
+  return $("dirFilter").value.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+}
+// 지금 화면에 보이는 폴더 (키워드 거르기 반영)
+function dirVisible(){
+  const kws = dirKeywords();
+  if(!kws.length) return state.dirList;
+  const exclude = $("dirFilterMode").value === "out";
+  return state.dirList.filter(d=>{
+    const hit = kws.some(k=>d.name.toLowerCase().includes(k));
+    return exclude ? !hit : hit;
+  });
+}
+function dirNewName(d){ return (d.name in state.dirNew) ? state.dirNew[d.name] : d.name; }
+function setDirNew(d, v){
+  if(v === d.name) delete state.dirNew[d.name]; else state.dirNew[d.name] = v;
+}
+
+// 윈도우에서 폴더 이름으로 쓸 수 없는 값인지 (서버에서도 한 번 더 막는다)
+const DIR_BAD_CHARS = /[\\/:*?"<>|\x00-\x1f]/;
+const DIR_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+function dirNameProblem(name){
+  if(!name.trim()) return "이름이 비어 있음";
+  if(DIR_BAD_CHARS.test(name)) return '\\ / : * ? " < > | 는 못 씀';
+  if(/[ .]$/.test(name)) return "끝에 공백·마침표 못 씀";
+  if(DIR_RESERVED.test(name.split(".")[0].trim())) return "윈도우 예약어";
+  if(name.length > 255) return "이름이 너무 김";
+  return "";
+}
+// 모든 폴더의 '바뀐 뒤 이름'을 한꺼번에 보고, 바뀌는 줄과 문제 있는 줄을 가린다.
+// 이름끼리 겹치는지는 대소문자를 가리지 않는다(윈도우 방식). 같은 폴더의 파일·숨김 폴더와도 견준다.
+function dirCheck(){
+  const count = new Map();
+  const bump = nm => { const k = nm.toLowerCase(); count.set(k, (count.get(k) || 0) + 1); };
+  state.dirList.forEach(d=>bump(dirNewName(d)));
+  state.dirOthers.forEach(bump);
+  const rows = {};
+  let changed = 0, bad = 0;
+  state.dirList.forEach(d=>{
+    const nv = dirNewName(d), ch = nv !== d.name;
+    let p = "";
+    if(ch){
+      p = dirNameProblem(nv);
+      if(!p && count.get(nv.toLowerCase()) > 1) p = "다른 이름과 겹침";
+      changed++; if(p) bad++;
+    }
+    rows[d.name] = {nv, ch, p};
+  });
+  return {rows, changed, bad};
+}
+
+function renderDirs(errMsg){
+  const box = $("dirRows"); if(!box) return;
+  const vis = dirVisible();
+  // 보이지 않게 된 폴더의 선택은 풀어 둔다 — 보이는 것만 다루도록
+  const visNames = new Set(vis.map(d=>d.name));
+  for(const nm of [...state.dirSel]) if(!visNames.has(nm)) state.dirSel.delete(nm);
+  const chk = dirCheck();
+  const empty = msg => '<div class="empty">' + msg + '</div>';
+  if(!state.folder) box.innerHTML = empty("상단의 <b>폴더 선택</b>으로 폴더를 지정하세요.");
+  else if(errMsg) box.innerHTML = empty(esc(errMsg));
+  else if(state.dirFolder !== state.folder) box.innerHTML = empty("폴더를 읽는 중…");
+  else if(!state.dirList.length) box.innerHTML = empty("이 폴더 안에는 폴더가 없습니다.");
+  else if(!vis.length) box.innerHTML = empty("키워드에 맞는 폴더가 없습니다.");
+  else{
+    const idx = new Map(state.dirList.map((d,i)=>[d.name, i]));
+    box.innerHTML = vis.map(d=>{
+      const i = idx.get(d.name), r = chk.rows[d.name], sel = state.dirSel.has(d.name);
+      return `<div class="dirrow${sel?" sel":""}${r.ch?" changed":""}${r.p?" bad":""}" data-i="${i}"
+          onmousedown="onDirRowDown(event)" onclick="onDirRowClick(event,${i})">
+        <input type="checkbox" class="dirchk"${sel?" checked":""} onclick="event.stopPropagation();onDirRowClick(event,${i},true)">
+        <span class="dircur" title="${escA(d.name)}">${esc(d.name)}</span>
+        <input class="field dirname" value="${escA(r.nv)}" spellcheck="false" autocomplete="off"
+          oninput="onDirInput(${i},this.value)" onpaste="onDirPaste(event,${i})"
+          onkeydown="onDirKey(event,${i})" onclick="event.stopPropagation()">
+        <span class="dirmsg">${esc(r.p || (r.ch ? "바뀔 예정" : ""))}</span>
+        <button class="gobtn diropen" title="탐색기에서 열기" onclick="event.stopPropagation();openDirAt(${i})">열기</button>
+      </div>`;
+    }).join("");
+  }
+  updateDirSummary(chk, vis);
+}
+
+// 입력칸을 다시 그리지 않고 표시만 고친다 (타이핑 중 커서가 튀지 않도록)
+function refreshDirMarks(){
+  const chk = dirCheck();
+  document.querySelectorAll("#dirRows .dirrow").forEach(row=>{
+    const d = state.dirList[+row.dataset.i]; if(!d) return;
+    const r = chk.rows[d.name], sel = state.dirSel.has(d.name);
+    row.classList.toggle("sel", sel);
+    row.classList.toggle("changed", r.ch);
+    row.classList.toggle("bad", !!r.p);
+    const cb = row.querySelector(".dirchk"); if(cb) cb.checked = sel;
+    const m = row.querySelector(".dirmsg"); if(m) m.textContent = r.p || (r.ch ? "바뀔 예정" : "");
+  });
+  updateDirSummary(chk, dirVisible());
+}
+
+function updateDirSummary(chk, vis){
+  const nAll = state.dirList.length;
+  const nSel = vis.filter(d=>state.dirSel.has(d.name)).length;
+  const filtered = vis.length !== nAll;
+  $("dirInfo").textContent = !nAll ? "" :
+    `전체 ${nAll}개` + (filtered ? ` · 보이는 ${vis.length}개` : "") + (nSel ? ` · 선택 ${nSel}개` : "");
+  $("dirCopySel").disabled = !nSel;
+  $("dirCopySel").textContent = nSel ? `선택한 ${nSel}개 복사` : "선택한 폴더 복사";
+  $("dirCopyAll").disabled = !vis.length;
+  $("dirCopyAll").textContent = filtered ? `보이는 ${vis.length}개 복사` : (vis.length ? `전체 ${vis.length}개 복사` : "전체 복사");
+  const all = $("dirAll");
+  if(all){ all.checked = vis.length > 0 && nSel === vis.length; all.indeterminate = nSel > 0 && nSel < vis.length; }
+  if(state.tab !== "dirs") return;
+  $("btnRun").disabled = !chk.changed || chk.bad > 0;
+  let msg;
+  if(!state.folder) msg = "폴더를 먼저 선택하세요";
+  else if(!chk.changed) msg = `폴더 ${nAll}개 · 이름을 고치면 여기에 표시됩니다`;
+  else if(chk.bad) msg = `바뀔 폴더 <b>${chk.changed}</b>개 · <span class="warn">빨간 줄 ${chk.bad}개를 먼저 고치세요</span>`;
+  else msg = `바뀔 폴더 <b class="ok">${chk.changed}</b>개 · <b>Ctrl+Enter</b> 로 실행`;
+  const shown = new Set(vis.map(d=>d.name));
+  const hidden = state.dirList.filter(d=>chk.rows[d.name].ch && !shown.has(d.name)).length;
+  if(hidden) msg += ` <span class="hint">(키워드로 가려진 ${hidden}개 포함)</span>`;
+  setStatus(msg, false, true);
+}
+
+function onDirFilter(){ state.dirAnchor = null; renderDirs(); }
+
+// ----- 선택: 줄을 누르면 전환, Shift 로 범위 -----
+function onDirRowDown(e){
+  // Shift 로 범위를 고를 때 글자가 드래그 선택되지 않도록
+  if(e.shiftKey && !(e.target.closest && e.target.closest("input,button"))) e.preventDefault();
+}
+function onDirRowClick(e, i, fromBox){
+  if(!fromBox && e.target.closest && e.target.closest("input,button")) return;
+  const name = state.dirList[i].name;
+  if(e.shiftKey && state.dirAnchor){
+    const vis = dirVisible();
+    const a = vis.findIndex(d=>d.name === state.dirAnchor), b = vis.findIndex(d=>d.name === name);
+    if(a >= 0 && b >= 0){
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      for(let k = lo; k <= hi; k++) state.dirSel.add(vis[k].name);
+      refreshDirMarks(); return;
+    }
+  }
+  if(state.dirSel.has(name)) state.dirSel.delete(name); else state.dirSel.add(name);
+  state.dirAnchor = name;
+  refreshDirMarks();
+}
+function dirToggleAll(on){
+  if(on) dirVisible().forEach(d=>state.dirSel.add(d.name)); else state.dirSel.clear();
+  refreshDirMarks();
+}
+
+// ----- 복사 -----
+async function copyText(text){
+  try{ await navigator.clipboard.writeText(text); return true; }catch(e){}
+  try{          // 클립보드 API 를 못 쓰는 환경을 위한 예전 방식
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand("copy"); ta.remove(); return ok;
+  }catch(e){ return false; }
+}
+async function copyDirs(which){
+  const vis = dirVisible();
+  const list = which === "sel" ? vis.filter(d=>state.dirSel.has(d.name)) : vis;
+  if(!list.length){ setStatus(which === "sel" ? "복사할 폴더를 먼저 선택하세요." : "복사할 폴더가 없습니다.", true); return; }
+  const full = $("dirFullPath").checked;
+  const base = state.folder.replace(/[\\/]+$/, "") + "\\";
+  // 윈도우 줄바꿈으로 — 엑셀·메모장 어디에 붙여도 한 줄에 하나씩 들어간다
+  const text = list.map(d=>full ? base + d.name : d.name).join("\r\n");
+  const ok = await copyText(text);
+  setStatus(ok
+    ? `<b class="ok">폴더 ${list.length}개의 ${full ? "전체 경로를" : "이름을"} 복사했습니다</b> · 엑셀이나 메모장에 붙여넣으면 한 줄에 하나씩 들어갑니다`
+    : "복사하지 못했습니다. 브라우저가 클립보드 사용을 막았을 수 있습니다.", !ok, true);
+}
+
+// ----- 이름 고치기 -----
+function onDirInput(i, v){ setDirNew(state.dirList[i], v); refreshDirMarks(); }
+
+function dirInputs(){ return [...document.querySelectorAll("#dirRows input.dirname")]; }
+function focusDirRow(i){
+  const el = document.querySelector(`#dirRows .dirrow[data-i="${i}"] input.dirname`);
+  if(el){ el.focus(); const n = el.value.length; el.setSelectionRange(n, n); }
+}
+function onDirKey(e, i){
+  if(e.key === "Escape"){                       // 이 칸만 원래 이름으로
+    e.preventDefault(); e.stopPropagation();
+    const d = state.dirList[i]; delete state.dirNew[d.name];
+    e.target.value = d.name; refreshDirMarks(); return;
+  }
+  if(e.key !== "Enter" || e.ctrlKey || e.metaKey) return;   // Ctrl+Enter 는 '이름 변경 실행'
+  if(e.isComposing || e.keyCode === 229) return;            // 한글 조합 확정용 Enter
+  e.preventDefault();
+  const list = dirInputs(), k = list.indexOf(e.target);
+  const next = list[k + (e.shiftKey ? -1 : 1)];            // Shift+Enter 는 위로
+  if(next){ next.focus(); const n = next.value.length; next.setSelectionRange(n, n); }
+}
+
+// 여러 줄을 붙여넣으면 한꺼번에 채운다.
+//  · 두 칸(기존 이름 | 새 이름)이고 첫 칸이 실제 폴더 이름이면 → 이름끼리 맞춰 넣는다 (순서 무관)
+//  · 그 밖에는 붙여넣은 칸부터 아래로 차례대로 넣는다 (여러 칸이면 마지막 칸을 새 이름으로)
+function onDirPaste(e, i){
+  const text = (e.clipboardData || window.clipboardData).getData("text") || "";
+  const body = text.replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+  if(!/[\n\t]/.test(body)) return;             // 한 줄짜리는 평소처럼 붙여넣기
+  e.preventDefault();
+  const rows = body.split("\n").map(l=>l.split("\t").map(c=>c.trim()));
+  const filled = rows.filter(r=>r.some(Boolean));
+  const byName = new Map(state.dirList.map(d=>[d.name.toLowerCase(), d]));
+  const pairs = filled.filter(r=>r.length >= 2 && r[0]);
+  const matched = pairs.filter(r=>byName.has(r[0].toLowerCase()));
+  if(pairs.length && pairs.length === filled.length && matched.length >= Math.ceil(pairs.length * 0.8)){
+    let cnt = 0;
+    matched.forEach(r=>{
+      const d = byName.get(r[0].toLowerCase()), nv = r[r.length - 1];
+      if(nv){ setDirNew(d, nv); cnt++; }
+    });
+    renderDirs(); focusDirRow(i);
+    const miss = pairs.length - matched.length;
+    setStatus(`기존 이름에 맞춰 폴더 ${cnt}개의 새 이름을 넣었습니다.`
+      + (miss ? ` <span class="warn">목록에 없는 이름 ${miss}줄은 건너뛰었습니다.</span>` : "")
+      + " 아직 실제로 바뀐 것은 아닙니다 — 확인 후 Ctrl+Enter.", false, true);
+    return;
+  }
+  const vis = dirVisible();
+  const start = vis.findIndex(d=>d === state.dirList[i]);
+  let cnt = 0;
+  rows.forEach((r, k)=>{
+    const d = vis[start + k]; if(!d) return;
+    const nv = r.filter(Boolean).pop() || "";
+    if(!nv) return;                            // 빈 줄은 그 폴더를 그대로 둔다
+    setDirNew(d, nv); cnt++;
+  });
+  const over = Math.max(0, rows.length - (vis.length - start));
+  renderDirs(); focusDirRow(i);
+  setStatus(`폴더 ${cnt}개에 새 이름을 붙여넣었습니다.`
+    + (over ? ` <span class="warn">목록보다 ${over}줄 많아 나머지는 넣지 않았습니다.</span>` : "")
+    + " 아직 실제로 바뀐 것은 아닙니다 — 확인 후 Ctrl+Enter.", false, true);
+}
+
+function dirReplaceAll(){
+  const find = $("dirFind").value, repl = $("dirRepl").value;
+  if(!find){ setStatus("찾을 글자를 입력하세요.", true); $("dirFind").focus(); return; }
+  const vis = dirVisible();
+  const targets = state.dirSel.size ? vis.filter(d=>state.dirSel.has(d.name)) : vis;
+  let cnt = 0;
+  targets.forEach(d=>{
+    const cur = dirNewName(d), nv = cur.split(find).join(repl);
+    if(nv !== cur){ setDirNew(d, nv); cnt++; }
+  });
+  renderDirs();
+  setStatus(cnt
+    ? `폴더 ${cnt}개의 새 이름을 바꿨습니다 ('${esc(find)}' → '${esc(repl)}'). 아직 실제로 바뀐 것은 아닙니다 — 확인 후 Ctrl+Enter.`
+    : `찾는 글자가 들어간 이름이 없습니다: '${esc(find)}'`, !cnt, true);
+}
+function dirResetAll(){
+  const had = Object.keys(state.dirNew).length;
+  state.dirNew = {}; renderDirs();
+  if(had) setStatus(`입력한 새 이름 ${had}개를 모두 되돌렸습니다.`, false);
+}
+function openDirAt(i){
+  const d = state.dirList[i]; if(!d) return;
+  openPath(state.folder.replace(/[\\/]+$/, "") + "\\" + d.name);
+}
+
+// ----- 실행 -----
+function dirJobs(){
+  const chk = dirCheck();
+  const jobs = state.dirList.filter(d=>chk.rows[d.name].ch).map(d=>({src:d.name, dst:chk.rows[d.name].nv}));
+  return {chk, jobs};
+}
+function askRenameDirs(){
+  const {chk, jobs} = dirJobs();
+  if(!jobs.length) return;
+  if(chk.bad){ setStatus(`빨간 줄 ${chk.bad}개의 이름을 먼저 고치세요.`, true); return; }
+  const sample = jobs.slice(0, 8)
+    .map(j=>`${esc(j.src)} <span class="hint">→</span> <b>${esc(j.dst)}</b>`).join("<br>");
+  showDialog("폴더 이름 변경",
+    `폴더 <b>${jobs.length}개</b>의 이름을 바꿉니다.<br><br>` + sample
+      + (jobs.length > 8 ? `<br><span class="hint">… 외 ${jobs.length - 8}개</span>` : "")
+      + `<br><br>실행한 뒤 <b>실행 취소</b>로 한 번에 되돌릴 수 있습니다.`,
+    `${jobs.length}개 이름 바꾸기`, ()=>applyDirRenames(jobs));
+}
+async function applyDirRenames(jobs){
+  const res = await api("/api/rename_dirs", {folder:state.folder, jobs});
+  if(res.error){ setStatus(esc(res.error), true, true); return; }
+  state.canUndo = res.canUndo; $("btnUndo").disabled = !res.canUndo;
+  // 실패한 폴더는 입력한 새 이름을 남겨 두고, 성공한 폴더는 선택을 새 이름으로 옮긴다
+  const failed = new Set((res.errors || []).map(er=>String(er).split(": ")[0]));
+  const keep = {};
+  jobs.forEach(j=>{ if(failed.has(j.src)) keep[j.src] = j.dst; });
+  const moved = new Map(jobs.filter(j=>!failed.has(j.src)).map(j=>[j.src, j.dst]));
+  state.dirSel = new Set([...state.dirSel].map(nm=>moved.get(nm) || nm));
+  state.dirNew = keep;
+  await loadDirs();
+  let msg = `<b class="ok">폴더 ${res.done}개 이름 변경 완료</b> · 실행 취소 가능`;
+  if(res.errors.length) msg += ` · <span class="warn">실패 ${res.errors.length}건: ${esc(res.errors[0])}</span>`;
+  msg += ` <button class="gobtn" onclick="openFolder()">탐색기에서 열기</button>`;
+  setStatus(msg, false, true);
+  addHistory("폴더 이름 변경", `${res.done}개 성공` + (res.errors.length ? ` · 실패 ${res.errors.length}건` : ""));
+}
+
+// ----- 단축키: Ctrl+C 복사 · Ctrl+A 전체 선택 (입력칸 밖에서만) -----
+document.addEventListener("keydown", e=>{
+  if(state.tab !== "dirs" || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+  const t = e.target;
+  if(t && ((t.tagName === "INPUT" && t.type !== "checkbox") || t.tagName === "TEXTAREA"
+           || t.tagName === "SELECT" || t.isContentEditable)) return;      // 입력 중엔 평소대로
+  if($("scrim").classList.contains("show")) return;
+  const k = (e.key || "").toLowerCase();
+  if(k === "c"){
+    if(String(window.getSelection() || "").trim()) return;   // 글자를 직접 골라 둔 게 있으면 그걸 복사
+    e.preventDefault();
+    copyDirs(dirVisible().some(d=>state.dirSel.has(d.name)) ? "sel" : "view");
+  }else if(k === "a"){
+    e.preventDefault(); dirToggleAll(true);
+  }
+});
+
 // ============ 표 형태 입력칸: 방향키 이동 + F2 편집 ============
 // 같은 성격의 줄이 여러 개인 입력칸에서 엑셀처럼 칸 사이를 옮겨 다닌다.
 //  · 방향키로 옮겨온 칸은 값이 통째로 선택된 '고른 상태'.
@@ -3289,6 +3765,7 @@ const GRID_DEFS = [
   {box:"mapFields", row:".maprow", cell:"input"},        // 키워드별 지정값으로 변경
   {box:"kwFields",  row:".kwrow",  cell:"input"},        // 키워드별 정리
   {box:"rows",      row:".frow",   cell:"input.tcell"},  // 미리보기 표의 '붙일 텍스트'
+  {box:"dirRows",   row:".dirrow", cell:"input.dirname"}, // 폴더 목록의 새 이름
 ];
 let gridNavCell = null;        // 방향키로 옮겨와 '고른 상태'인 칸
 
@@ -3882,6 +4359,29 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == "/api/map_scan":
                     return self._json({"folders": map_scan(body.get("folders", []),
                                                            body.get("rules", []))})
+
+                if self.path == "/api/subdirs":
+                    folder = body.get("folder", "")
+                    if not os.path.isdir(folder):
+                        return self._json({"error": "폴더를 찾을 수 없습니다: " + folder})
+                    dirs, others = list_subdirs(folder)
+                    return self._json({"dirs": dirs, "others": others})
+
+                if self.path == "/api/rename_dirs":
+                    folder = body.get("folder", "")
+                    if not os.path.isdir(folder):
+                        return self._json({"error": "폴더를 찾을 수 없습니다"})
+                    jobs = body.get("jobs", [])
+                    for j in jobs:
+                        src, dst = j.get("src", ""), j.get("dst", "")
+                        why = check_dir_name(dst)
+                        if why:
+                            return self._json({"error": f"{src} → {dst}: {why}"})
+                        if not os.path.isdir(safe_join(folder, src)):
+                            return self._json({"error": "폴더를 찾을 수 없습니다: " + src})
+                    done, errors = execute_jobs(folder, jobs, "rename")
+                    return self._json({"done": done, "errors": errors,
+                                       "canUndo": bool(UNDO_STACK)})
 
                 if self.path == "/api/list":
                     folder = body.get("folder", "")
