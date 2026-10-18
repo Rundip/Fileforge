@@ -176,7 +176,7 @@ def check_dir_name(name):
     if not name or not name.strip():
         return "이름이 비어 있습니다"
     if any(c in _BAD_NAME_CHARS or ord(c) < 32 for c in name):
-        return '\\ / : * ? " < > | 는 폴더 이름에 쓸 수 없습니다'
+        return '\\ / : * ? " < > | 는 이름에 쓸 수 없습니다'
     if name != name.rstrip(" ."):
         return "이름 끝에 공백이나 마침표를 둘 수 없습니다"
     if name.split(".")[0].strip().upper() in _RESERVED_NAMES:
@@ -1315,7 +1315,18 @@ _DIALOG_REQ = queue.Queue()        # 워커 스레드 → 메인 스레드 다�
 _DIALOG_READY = threading.Event()  # 메인 스레드 디스패처가 돌고 있는지
 
 
-def _show_folder_dialog():
+def _start_dir(start):
+    """폴더 선택창을 열 위치. 그 폴더가 없어졌으면 남아 있는 가장 가까운 상위 폴더."""
+    p = (start or "").strip()
+    while p and not os.path.isdir(p):
+        parent = os.path.dirname(p.rstrip("\\/"))
+        if parent == p:
+            return None
+        p = parent
+    return p or None
+
+
+def _show_folder_dialog(start=None):
     """tkinter 폴더 선택 다이얼로그를 띄우고 선택 경로(문자열)를 돌려준다.
     반드시 자신을 소유한 스레드(메인 스레드 권장)에서 호출할 것."""
     global _TK_ROOT
@@ -1325,7 +1336,11 @@ def _show_folder_dialog():
         _TK_ROOT = tk.Tk()
         _TK_ROOT.withdraw()
     _TK_ROOT.attributes('-topmost', True)
-    return filedialog.askdirectory(title='대상 폴더를 선택하세요') or ''
+    opts = {"title": "대상 폴더를 선택하세요"}
+    where = _start_dir(start)
+    if where:
+        opts["initialdir"] = where          # 지금 작업 중인 폴더에서 연다
+    return filedialog.askdirectory(**opts) or ''
 
 
 # ---------- 여러 폴더를 한 번에 고르기 (Windows IFileOpenDialog) ----------
@@ -1346,12 +1361,12 @@ def _com_call(ptr, index, restype, argtypes, *args):
     return fn(ptr, *args)
 
 
-def _show_multi_folder_dialog():
+def _show_multi_folder_dialog(start=None):
     """폴더를 여러 개 고르는 대화상자. 취소하면 빈 목록을 돌려준다.
 
     윈도우가 아니거나 대화상자를 못 여는 환경에서는 기존 단일 선택창으로 물러난다."""
     if os.name != "nt":
-        one = _show_folder_dialog()
+        one = _show_folder_dialog(start)
         return [one] if one else []
 
     import ctypes
@@ -1387,6 +1402,19 @@ def _show_multi_folder_dialog():
         _com_call(dlg, 17, HR, [c_wchar_p],                               # SetTitle
                   "폴더를 여러 개 선택하세요 — 드래그하거나 Ctrl 을 누른 채 클릭")
         _com_call(dlg, 18, HR, [c_wchar_p], "이 폴더들 선택")              # SetOkButtonLabel
+        where = _start_dir(start)
+        if where:                                                         # 지금 작업 중인 폴더에서 연다
+            try:
+                item = c_void_p()
+                ctypes.OleDLL("shell32").SHCreateItemFromParsingName(
+                    c_wchar_p(where), None,
+                    byref(guid("{43826D1E-E718-42EE-BC55-A1E261C37BFE}")), byref(item))  # IShellItem
+                try:
+                    _com_call(dlg, 12, HR, [c_void_p], item)              # SetFolder
+                finally:
+                    _com_call(item, 2, c_ulong, [])                        # Release
+            except OSError:
+                pass                                                      # 못 열면 기본 위치에서
         try:
             _com_call(dlg, 3, HR, [c_void_p], None)                       # Show
         except OSError as e:
@@ -1428,16 +1456,16 @@ def _dialog_dispatcher():
     _DIALOG_READY.set()
     while not STOP.is_set():
         try:
-            kind, resp = _DIALOG_REQ.get(timeout=0.5)
+            kind, resp, start = _DIALOG_REQ.get(timeout=0.5)
         except queue.Empty:
             continue
         try:
-            resp.put(_show_multi_folder_dialog() if kind == "multi" else _show_folder_dialog())
+            resp.put(_show_multi_folder_dialog(start) if kind == "multi" else _show_folder_dialog(start))
         except Exception:      # 다이얼로그 실패가 서버를 멈추게 하지는 않는다
             resp.put([] if kind == "multi" else "")
 
 
-def _pick_folder_via_self():
+def _pick_folder_via_self(start=None):
     """frozen exe 전용: exe 자신을 특수 모드로 재실행하여 자식 프로세스의
     '메인 스레드'에서 다이얼로그를 띄우고, 결과를 임시 파일로 받는다.
     (HTTP 워커 스레드에서 직접 Tk를 돌리지 않으므로 안전)"""
@@ -1446,6 +1474,7 @@ def _pick_folder_via_self():
     try:
         env = dict(os.environ)
         env["FILEFORGE_PICK_OUT"] = tmp
+        env["FILEFORGE_PICK_START"] = start or ""
         subprocess.run([sys.executable], env=env, timeout=300)
         with open(tmp, "r", encoding="utf-8") as f:
             picked = f.read()
@@ -1460,22 +1489,22 @@ def _pick_folder_via_self():
     return picked.replace("/", os.sep) if picked else None
 
 
-def _ask_dialog(kind, on_timeout):
+def _ask_dialog(kind, on_timeout, start=None):
     """메인 스레드 디스패처에 대화상자를 요청하고 결과를 기다린다."""
     resp = queue.Queue(1)
-    _DIALOG_REQ.put((kind, resp))
+    _DIALOG_REQ.put((kind, resp, start))
     try:
         return resp.get(timeout=600)
     except queue.Empty:
         return on_timeout
 
 
-def pick_folders_native():
+def pick_folders_native(start=None):
     """폴더 여러 개를 한 번에 고른다. 정리된 절대경로 목록을 돌려준다."""
     if not _DIALOG_READY.is_set():
-        one = pick_folder_native()
+        one = pick_folder_native(start)
         return [one] if one else []
-    picked = _ask_dialog("multi", []) or []
+    picked = _ask_dialog("multi", [], start) or []
     out, seen = [], set()
     for p in picked:
         p = (p or "").strip().rstrip("/").replace("/", os.sep)
@@ -1504,15 +1533,17 @@ def map_scan(folders, rules):
 
     out = []
     for idx, folder in enumerate(folders or []):
-        info = {"folder": folder, "missing": False, "total": 0, "jobs": []}
+        info = {"folder": folder, "missing": False, "total": 0, "jobs": [], "skipped": []}
         if not os.path.isdir(folder):
             info["missing"] = True
             out.append(info)
             continue
         if pairs:
             try:
+                names = set()               # 그 폴더에 이미 있는 모든 이름 (겹침 검사용)
                 with os.scandir(folder) as it:
                     for entry in it:
+                        names.add(entry.name.lower())
                         if entry.name.startswith("."):
                             continue
                         try:
@@ -1529,6 +1560,7 @@ def map_scan(folders, rules):
                                 if dst != entry.name:
                                     info["jobs"].append({"src": entry.name, "dst": dst, "d": idx})
                                 break
+                _drop_map_conflicts(info, names)
             except OSError as e:
                 info["missing"] = True
                 info["error"] = str(e)
@@ -1536,24 +1568,49 @@ def map_scan(folders, rules):
     return out
 
 
-def pick_folder_native():
+def _drop_map_conflicts(info, names):
+    """실행하면 거부될 줄을 미리 빼서 skipped 로 옮긴다.
+    (못 쓰는 이름 / 그대로 남는 이름과 겹침 / 바꿀 이름끼리 겹침)"""
+    jobs = info["jobs"]
+    for j in list(jobs):
+        why = check_dir_name(j["dst"])
+        if why:
+            jobs.remove(j); info["skipped"].append(dict(j, reason=why))
+    count = {}
+    for j in jobs:
+        count[j["dst"].lower()] = count.get(j["dst"].lower(), 0) + 1
+    for j in list(jobs):
+        if count[j["dst"].lower()] > 1:
+            jobs.remove(j); info["skipped"].append(dict(j, reason="바꿀 이름끼리 겹침"))
+    again = True
+    while again:                       # 하나를 빼면 그 이름이 다시 남으므로 되풀이
+        again = False
+        vacated = {j["src"].lower() for j in jobs}
+        for j in list(jobs):
+            k = j["dst"].lower()
+            if k in names and k not in vacated:
+                jobs.remove(j); info["skipped"].append(dict(j, reason="같은 이름이 이미 있음"))
+                again = True
+
+
+def pick_folder_native(start=None):
     """폴더 선택 다이얼로그 (HTTP 워커 스레드에서 호출된다).
 
     메인 스레드 디스패처가 돌고 있으면 같은 프로세스 안에서 곧바로 띄운다.
     디스패처가 없을 때만 예전 방식(별도 프로세스)으로 되돌아간다.
     """
     if _DIALOG_READY.is_set():
-        picked = _ask_dialog("one", "")
+        picked = _ask_dialog("one", "", start)
         picked = (picked or "").strip().rstrip("/")
         return picked.replace("/", os.sep) if picked else None
 
     if getattr(sys, "frozen", False):
-        return _pick_folder_via_self()
+        return _pick_folder_via_self(start)
     code = (
         "import tkinter as tk\n"
         "from tkinter import filedialog\n"
         "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
-        "print(filedialog.askdirectory(title='대상 폴더를 선택하세요') or '')\n"
+        f"print(filedialog.askdirectory(title='대상 폴더를 선택하세요', initialdir={_start_dir(start)!r}) or '')\n"
     )
     try:
         out = subprocess.run([sys.executable, "-c", code],
@@ -1589,6 +1646,9 @@ button{font-family:var(--font-ui);cursor:pointer;border:none;background:none;col
 input{font-family:var(--font-ui);font-size:16px;color:var(--ink)}
 
 /* ===== utility bar (36px, soft-cloud) ===== */
+.connlost{display:none;position:sticky;top:0;z-index:90;background:var(--sale);color:#fff;
+  padding:12px 48px;font-size:14px;line-height:1.5}
+.connlost.show{display:block}
 .utility{background:var(--cloud);height:36px;display:flex;align-items:center;
   justify-content:flex-end;gap:24px;padding:0 48px;font-size:12px;font-weight:500}
 
@@ -1922,6 +1982,11 @@ footer{border-top:1px solid var(--hairline);margin-top:48px;padding:24px 48px;
 </style>
 </head>
 <body>
+
+<div class="connlost" id="connLost" role="alert">
+  <b>FileForge 프로그램과 연결이 끊겼습니다.</b>
+  FileForge 를 다시 실행하면 새 창이 열립니다. 이 탭은 닫아도 됩니다.
+</div>
 
 <div class="utility"><span>FileForge — 파일 자동화 도구</span>
   <span class="saved" id="savedAt">자동저장 대기 중</span>
@@ -2384,14 +2449,26 @@ let state = {folder:"", files:[], allNames:[], dirs:[], tab:"rename", org:"categ
              renameTarget:"files", loadedInclude:"", mkMode:"list", mkPlan:null};
 const $ = id => document.getElementById(id);
 
+// 서버(이 PC 의 FileForge)가 꺼졌거나 응답이 이상해도 화면이 멈추지 않도록, 실패를 늘 {error} 로 돌려준다.
+const CONN_LOST = "FileForge 프로그램과 연결이 끊겼습니다. FileForge 를 다시 실행해 주세요.";
 async function api(path, body){
-  const r = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
-                              body:JSON.stringify(body||{})});
-  return r.json();
+  let r;
+  try{
+    r = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
+                          body:JSON.stringify(body||{})});
+  }catch(e){
+    showConnLost(true);
+    return {error: CONN_LOST};
+  }
+  try{ return await r.json(); }
+  catch(e){ return {error: `프로그램이 알 수 없는 응답을 보냈습니다 (${r.status}). FileForge 를 다시 실행해 주세요.`}; }
+}
+function showConnLost(on){
+  const el = $("connLost"); if(el) el.classList.toggle("show", !!on);
 }
 
 async function pickFolder(){
-  const res = await api("/api/pick");
+  const res = await api("/api/pick", {start: state.folder});
   if(res.path){ state.folder = res.path; await reload(); }
 }
 
@@ -2423,7 +2500,10 @@ async function reload(silent){
     return;
   }
   res.files.forEach(f=>f.excluded=false);
-  state.files = res.files; state.allNames = res.allNames; state.dirs = res.dirs || []; state.perText = {};
+  state.files = res.files; state.allNames = res.allNames; state.dirs = res.dirs || [];
+  // 파일별 텍스트는 다른 폴더로 옮겼을 때만 비운다. 예전에는 목록을 다시 읽을 때마다
+  // (확장자 필터 입력, 탭 전환, 실행 뒤, '이어서 하기' 복원 직후) 입력한 내용이 모두 사라졌다.
+  if(state.textFolder !== state.folder){ state.perText = {}; state.textFolder = state.folder; }
   state.loadedInclude = include;
   document.body.classList.add("loaded");
   $("heroTitle").innerHTML = "Forge Every File.";
@@ -2493,7 +2573,13 @@ function pickOrg(chip){
 }
 
 // ----- 키워드별 정리: 동적 입력 필드 -----
-function sanitizeFolder(s){ return s.trim().replace(/[\\/:*?"<>|]/g,"_"); }
+function sanitizeFolder(s){
+  // 끝의 마침표·공백은 윈도우가 떼어 버리고, 비면 경로가 폴더 밖을 가리키게 된다
+  let v = s.trim().replace(/[\\/:*?"<>|]/g,"_").replace(/[. ]+$/,"");
+  if(!v) v = "_";
+  if(DIR_RESERVED.test(v.split(".")[0].trim())) v += "_";
+  return v;
+}
 
 function renderKwFields(){
   let h = "";
@@ -2560,7 +2646,7 @@ function addMapRow(at, key){
 }
 // ----- 키워드별 지정값으로 변경: 여러 폴더에 한꺼번에 적용 -----
 async function pickManyFolders(){
-  const res = await api("/api/pick_many");
+  const res = await api("/api/pick_many", {start: state.mapFolders[0] || state.folder});
   const paths = res.paths || [];
   if(!paths.length) return;                 // 취소했거나 고른 게 없음
   state.mapFolders = paths;
@@ -2595,19 +2681,24 @@ function renderMapFolders(){
   clear.style.display = "";
   const scan = state.mapScan || [];
   box.innerHTML = state.mapFolders.map((f,i)=>{
-    const s = scan[i] || {}, hit = (s.jobs || []).length;
+    const s = scan[i] || {}, hit = (s.jobs || []).length, skip = s.skipped || [];
+    const skipTip = skip.map(k=>`${k.src} → ${k.dst}: ${k.reason}`).join("\n");
     const info = s.missing
       ? '<span class="mfcount warn">폴더를 찾을 수 없음</span>'
-      : `<span class="mfcount ${hit ? "ok" : "hint"}">${hit}개 바뀜</span>`;
+      : `<span class="mfcount ${hit ? "ok" : "hint"}">${hit}개 바뀜`
+        + (skip.length ? ` · <span class="warn" title="${escA(skipTip)}">⚠ 건너뜀 ${skip.length}개</span>` : "")
+        + `</span>`;
     return `<div class="mfrow"><span class="mfpath" title="${escA(f)}">${esc(f)}</span>${info}`
       + `<button class="gobtn" onclick="openMapFolder(${i})">탐색기에서 열기</button></div>`;
   }).join("");
   const jobs = mapJobs();
   row.style.display = "";
   $("mapApplyBtn").disabled = !jobs.length;
-  $("mapApplyInfo").innerHTML = jobs.length
+  const nSkip = (state.mapScan || []).reduce((a, s)=>a + (s.skipped || []).length, 0);
+  $("mapApplyInfo").innerHTML = (jobs.length
     ? `폴더 ${state.mapFolders.length}개에서 <b class="ok">${jobs.length}개</b> 파일 이름이 바뀝니다.`
-    : "규칙에 해당하는 파일이 없습니다. 위 표에 왼쪽·오른쪽 값을 입력하세요.";
+    : "규칙에 해당하는 파일이 없습니다. 위 표에 왼쪽·오른쪽 값을 입력하세요.")
+    + (nSkip ? ` <span class="warn">이미 있는 이름과 겹치거나 쓸 수 없는 이름 ${nSkip}개는 건너뜁니다 (⚠ 에 마우스를 올리면 이유가 보입니다).</span>` : "");
 }
 function askApplyMap(){
   const jobs = mapJobs();
@@ -2786,7 +2877,9 @@ function computePreview(){
     }else{
       const nn = buildNewName(f, seq++);
       const stem = splitName(nn, f.isDir)[0];
-      if(INVALID.test(nn) || !stem.trim()) state.preview.push({disp:nn, st:"⚠ 사용불가", target:null});
+      // 끝의 마침표·공백은 윈도우가 몰래 떼어 버려 '성공'이라 나오고 실제로는 안 바뀌고,
+      // CON·PRN 같은 예약어는 아예 만들 수 없다. 폴더 목록 탭과 같은 기준으로 막는다.
+      if(INVALID.test(nn) || !stem.trim() || dirNameProblem(nn)) state.preview.push({disp:nn, st:"⚠ 사용불가", target:null});
       else if(nn===f.name) state.preview.push({disp:nn, st:"변경 없음", target:null});
       else state.preview.push({disp:nn, st:"변경", target:nn});
     }
@@ -2801,13 +2894,21 @@ function computePreview(){
     else seen[k]=idx;
   });
   if(!organize){
-    const sources = new Set(state.files.map(f=>f.name.toLowerCase()));
+    // 이미 있는 이름과 겹치는지 본다. 이번에 실제로 이름이 바뀌어 '비게 되는' 이름만 써도 된다.
+    // 예전에는 목록에 있는 파일이면 모두 비는 것으로 보아, 그대로 두는 파일이나 제외한 파일의
+    // 이름으로 바꾸는 줄도 '변경'으로 보이고 실행하면 거부됐다.
+    // 한 줄을 막으면 그 파일 이름이 다시 남게 되어 다른 줄이 겹칠 수 있으니 바뀌지 않을 때까지 되풀이한다.
     const existing = new Set(state.allNames.map(n=>n.toLowerCase()));
-    state.preview.forEach(p=>{
-      if(p.target && existing.has(p.target.toLowerCase()) && !sources.has(p.target.toLowerCase())){
-        p.st="⚠ 이미 존재"; p.target=null;
-      }
-    });
+    for(let again = true; again; ){
+      again = false;
+      const vacated = new Set();
+      state.files.forEach((f,i)=>{ if(state.preview[i].target) vacated.add(f.name.toLowerCase()); });
+      state.preview.forEach(p=>{
+        if(!p.target) return;
+        const k = p.target.toLowerCase();
+        if(existing.has(k) && !vacated.has(k)){ p.st="⚠ 이미 존재"; p.target=null; again = true; }
+      });
+    }
   }
   let nApply=0, nConflict=0;
   state.files.forEach((f,i)=>{
@@ -3499,6 +3600,7 @@ function applyDraft(d){
   state.mapRules = d.mapRules || [];
   state.mapFolders = d.mapFolders || [];
   state.perText  = d.perText  || {};
+  state.textFolder = (lsGet(PREF_KEY) || {}).folder;   // 복원한 텍스트가 첫 목록 읽기에서 지워지지 않게
   if(state.keywords.length) renderKwFields();
   if(state.mapRules.length) renderMapFields();
   if(state.mapFolders.length) scanMapFolders();      // 폴더가 지워졌는지도 여기서 확인된다
@@ -4399,9 +4501,12 @@ function formatPdfResult(op, res){
 // ── UI 수명 주기: 탭을 닫으면 백그라운드 서버도 함께 종료 ──
 const _TAB_ID = (window.crypto && crypto.randomUUID)
   ? crypto.randomUUID() : (Date.now() + "_" + Math.random());
+let _hbFail = 0;
 function _heartbeat(){
   fetch("/api/ping", {method:"POST", headers:{"Content-Type":"application/json"},
-                      body:JSON.stringify({tab:_TAB_ID}), keepalive:true}).catch(()=>{});
+                      body:JSON.stringify({tab:_TAB_ID}), keepalive:true})
+    .then(r=>{ if(r.ok){ _hbFail = 0; showConnLost(false); } })
+    .catch(()=>{ if(++_hbFail >= 2) showConnLost(true); });   // 두 번 연속 실패하면 알린다
 }
 _heartbeat();
 // TTL 이 70초라 15초면 충분하다. 탭을 닫을 때는 아래 sendBeacon 으로 즉시 알린다.
@@ -4479,11 +4584,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with LOCK:
                 if self.path == "/api/pick":
-                    path = pick_folder_native()
+                    path = pick_folder_native(body.get("start"))
                     return self._json({"path": path})
 
                 if self.path == "/api/pick_many":
-                    return self._json({"paths": pick_folders_native()})
+                    return self._json({"paths": pick_folders_native(body.get("start"))})
 
                 if self.path == "/api/map_scan":
                     return self._json({"folders": map_scan(body.get("folders", []),
@@ -4542,6 +4647,13 @@ class Handler(BaseHTTPRequestHandler):
                             return self._json({"error": bad})
                     elif not os.path.isdir(folder):
                         return self._json({"error": "폴더를 찾을 수 없습니다"})
+                    # 윈도우에서 못 쓰는 이름은 실행 전에 막는다. 예전에는 'abc.' 가 '성공'으로
+                    # 나오고 실제로는 안 바뀌었고, 'CON.hwp' 는 '이미 존재함' 이라는 엉뚱한 이유로 실패했다.
+                    for j in body.get("jobs", []):
+                        for part in str(j.get("dst", "")).replace("\\", "/").split("/"):
+                            why = check_dir_name(part)
+                            if why:
+                                return self._json({"error": f"{j.get('src', '')} → {j.get('dst', '')}: {why}"})
                     done, errors = execute_jobs(folder, body.get("jobs", []),
                                                 body.get("mode", "rename"), folders)
                     return self._json({"done": done, "errors": errors,
@@ -4734,8 +4846,20 @@ def _maybe_shutdown():
 
 def _watchdog():
     """만료된 탭을 걷어내고, 남은 탭이 없으면 종료를 트리거하는 데몬 스레드."""
+    global _START_TS
+    last = time.time()
     while not STOP.wait(1.0):
         now = time.time()
+        gap, last = now - last, now
+        if gap > 20:
+            # 1초마다 도는데 20초 넘게 비었다 = PC 가 절전에 들어갔다 깨어났다.
+            # 그동안 브라우저도 하트비트를 못 보냈으니, 탭이 닫혔다고 오해해 꺼지지 않도록
+            # 남은 시간을 그만큼 늘려 준다. (예전에는 깨어나자마자 프로그램이 종료됐다)
+            with TABS_LOCK:
+                for tid in ACTIVE_TABS:
+                    ACTIVE_TABS[tid] += gap
+            _START_TS += gap
+            continue
         with TABS_LOCK:
             for tid in [t for t, exp in ACTIVE_TABS.items() if exp <= now]:
                 del ACTIVE_TABS[tid]
@@ -4753,7 +4877,7 @@ def main():
     pick_out = os.environ.get("FILEFORGE_PICK_OUT")
     if pick_out:
         try:
-            picked = _show_folder_dialog()
+            picked = _show_folder_dialog(os.environ.get("FILEFORGE_PICK_START"))
         except Exception as e:  # 진단용: 실패 원인을 결과 파일에 남긴다
             picked = "__ERROR__ " + repr(e)
         try:
